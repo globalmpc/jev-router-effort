@@ -1,0 +1,61 @@
+{
+  "name": "@globalmpc/jev-router",
+  "version": "0.3.0",
+  "description": "Runs coding CLIs and routes each turn to the cheapest sufficient model using TypeSafe Jev",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/globalmpc/jev-router-effort.git"
+  },
+  "homepage": "https://github.com/globalmpc/jev-router-effort#readme",
+  "bugs": "https://github.com/globalmpc/jev-router-effort/issues",
+  "bin": {
+    "jev": "bin/jev.mjs",
+    "jev-a": "bin/jev-anti.mjs",
+    "jev-agy": "bin/jev-anti.mjs",
+    "jev-anti": "bin/jev-anti.mjs",
+    "jev-antigravity": "bin/jev-anti.mjs",
+    "jev-claude": "bin/jev-claude.mjs",
+    "jev-codex": "bin/jev-codex.mjs",
+    "jev-glm": "bin/jev-glm.mjs",
+    "jev-explain": "bin/jev-explain.mjs",
+    "jev-maintain": "bin/jev-maintain.mjs"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "prepublishOnly": "npm test"
+  },
+  "files": [
+    ".claude/skills",
+    "bin",
+    "skills",
+    "src",
+    "Analyzer/cli.mjs",
+    "Analyzer/lib",
+    "Analyzer/README.md",
+    "docs/routing-policy.json",
+    "docs/improvement-harness.md",
+    "docs/execution-safeguards.md",
+    "docs/capability-routing.md",
+    "README.md"
+  ],
+  "keywords": [
+    "claude",
+    "claude-code",
+    "codex",
+    "model-routing",
+    "jev",
+    "typesafe"
+  ],
+  "engines": {
+    "node": ">=20.12"
+  },
+  "publishConfig": {
+    "access": "restricted",
+    "registry": "https://registry.npmjs.org"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@typesafe-ai/sdk": "^0.6.0"
+  }
+}

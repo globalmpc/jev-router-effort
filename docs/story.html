@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Jev Router | Model and effort, chosen per turn</title>
+  <style>
+    :root{font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#eaf2f0;background:#0d161b;line-height:1.65}
+    *{box-sizing:border-box}body{margin:0}a{color:#84ecc0}a:hover{color:#bbffdd}.wrap{max-width:1100px;margin:auto;padding:0 26px}
+    header{border-bottom:1px solid #28393d}.nav{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:20px 0}.brand{color:#eaf2f0;text-decoration:none;font-weight:750;letter-spacing:.03em}
+        h1{font-size:clamp(2.4rem,6.8vw,5.2rem);line-height:1.08;letter-spacing:-.055em;max-width:900px;margin:24px 0}h2{font-size:clamp(1.7rem,3vw,2.6rem);line-height:1.2;letter-spacing:-.035em;margin:0 0 22px}
+    p{max-width:73ch;color:#bdcfcb}strong{color:#f5faf6}.eyebrow{color:#95e9b4;text-transform:uppercase;letter-spacing:.13em;font-size:.77rem;font-weight:700}main section{padding:65px 0;border-bottom:1px solid #273a3b}
+    .hero{padding-top:80px}.lead{font-size:1.2rem;max-width:750px}.pill{display:inline-block;background:#203d32;color:#b2ffd0;padding:5px 12px;border-radius:100px;margin:6px 6px 6px 0;font-size:.86rem}
+    .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px}.card{background:#142329;border:1px solid #2c4546;border-radius:18px;padding:23px;min-width:0}.card h3{margin:0 0 8px;font-size:1.25rem}.card p{margin:6px 0 18px}.card img{display:block;width:100%;height:auto;border-radius:10px;border:1px solid #3c4a4d}
+    figure{margin:0}figcaption{font-size:.88rem;color:#9bb4ae;margin-top:12px}.flow{display:flex;align-items:stretch;gap:10px;flex-wrap:wrap;margin:18px 0}.node{background:#172b2d;border:1px solid #48645b;border-radius:12px;padding:17px;flex:1 1 145px;min-width:145px}.node b{display:block;color:#b0f5c8}.arrow{align-self:center;color:#8dddac;font-size:1.4rem}.old .node{border-color:#715f54}
+    .note{background:#1c302d;border-left:3px solid #9aeaaf;padding:16px 20px;border-radius:0 10px 10px 0}.fine{font-size:.92rem;color:#9fb5b0}.cta{display:inline-block;border-radius:10px;background:#a6f2c1;color:#0a2017;text-decoration:none;padding:12px 18px;font-weight:700;margin-top:15px}
+    footer{padding:40px 0;color:#93aaa4}code{background:#26383a;padding:.15em .35em;border-radius:4px}img{max-width:100%}
+    @media(max-width:700px){.grid{grid-template-columns:1fr}.arrow{display:none}main section{padding:48px 0}.hero{padding-top:50px}}
+  </style>
+</head>
+<body>
+  <header><div class="wrap nav"><a class="brand" href="../README.md">← jev-router</a></div></header>
+  <main class="wrap">
+    <section class="hero"><span class="eyebrow">Per-turn routing for Claude Code, Codex, Antigravity and GLM</span><h1>Choose the model. Choose its effort. Keep working.</h1><p class="lead">Jev Router runs inside the coding CLI you already use. On each user turn it asks Jev for a recommendation, checks the models your signed-in account actually offers, and selects the final model and reasoning effort.</p><span class="pill">Model per turn</span><span class="pill">Effort per turn</span><span class="pill">Manual override</span><p><a class="cta" href="../README.md#quick-start">Install →</a></p></section>
+    <section><span class="eyebrow">Evidence from the terminal</span><h2>A routing decision, on screen</h2><div class="grid"><figure class="card"><h3>OpenAI Codex</h3><p>The decision line reports <strong>gpt-6-sol</strong> and <strong>effort auto → low (0.63)</strong>. The green outline highlights the effort field. The separate <code>confidence 0.15</code> belongs to the model-routing decision.</p><img src="assets/codex-effort-highlight.png" alt="Codex screenshot showing Jev Router auto and a green outline around effort auto to low, 0.63"><figcaption>Annotated screenshot. The outline was added and the prompt text was replaced with an English equivalent; the decision line is unchanged CLI output.</figcaption></figure></div><p class="fine">The image demonstrates a displayed decision. It does not benchmark speed or measure answer quality. <code>0.63</code> is an effort-selection score, not a speedup.</p></section>
+    <section><span class="eyebrow">Architecture</span><h2>The router goes first</h2><p>Instead of rewriting the request with a separate model before the working model sees it, the router makes one small decision and the working model receives the original request.</p><div class="flow" aria-label="Request path: user, Jev Router, working model, answer"><div class="node"><b>User</b>Original request</div><span class="arrow">→</span><div class="node"><b>Jev Router</b>Selects model and effort</div><span class="arrow">→</span><div class="node"><b>Working model</b>Does the task</div><span class="arrow">→</span><div class="node"><b>Answer</b>In the same CLI</div></div><p class="fine">The router adds one routing request per turn. It does not remove network latency or guarantee a faster response.</p></section>
+    <section><span class="eyebrow">Limits</span><h2>What automatic routing does not do</h2><p>Jev recommends a tier; this project applies policy, checks the account's model catalog and picks the final model and effort. You can still pick a model yourself, and doing so pauses automatic routing.</p><div class="note">Automatic routing reduces routine model-picking. It cannot guarantee a correct answer. Review important work and choose a stronger model when a second attempt would cost more than the upgrade.</div><p>Each routing decision sends the prompt and related task context to TypeSafe's Jev API. Provider terms for API keys and personal-account sign-in differ; you are responsible for complying with them.</p><a class="cta" href="../README.md">Setup and technical details →</a></section>
+  </main>
+  <footer class="wrap">Jev Router · <a href="../README.md">README</a> · <a href="../LICENSE">MIT license</a></footer>
+</body>
+</html>

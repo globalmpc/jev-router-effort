@@ -1,0 +1,27 @@
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # 20.12 is the core routing floor; Analyzer needs node:sqlite (22.15+).
+        node-version: ["20.12", "22.15"]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - run: npm ci
+      - if: matrix.node-version == '20.12'
+        run: node --test $(ls test/*.test.mjs | grep -v analyzer.test.mjs)
+      - if: matrix.node-version != '20.12'
+        run: npm test
