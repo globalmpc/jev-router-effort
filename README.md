@@ -455,3 +455,7 @@ does not restrict commercial use. Keep the original copyright and license notice
 redistributing the code.
 
 The upstream repository and base commit are recorded in [UPSTREAM.md](UPSTREAM.md).
+
+---
+
+Maintained by [Global MPC (Mineral Project Coin)](https://globalmpc.tech). Official site: https://globalmpc.tech
