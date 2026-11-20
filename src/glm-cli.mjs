@@ -1,8 +1,7 @@
 import { spawn } from "node:child_process";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { resolveAnti } from "./anti-cli.mjs";
 import { loadEnv } from "./codex-cli.mjs";
+import { checkKey } from "./credentials.mjs";
 import { GLM_DEFAULT_UPSTREAM, startGlmProxy } from "./glm-proxy.mjs";
 import { executionWorkspace } from './execution-workspace.mjs';
 import { childEnv } from "./child-env.mjs";
@@ -48,11 +47,8 @@ export async function runGlm(args = process.argv.slice(2)) {
 
   loadEnv();
   if (!process.env.JEV_API_KEY && !process.env.TYPESAFE_API_KEY) {
-    process.stderr.write(
-      "[jev] no JEV_API_KEY found - starting the ZAI CLI without routing\n" +
-        `[jev] add JEV_API_KEY=... to ${join(homedir(), ".jev-router.env")} and restart jev-glm\n`,
-    );
-    return execute(command, args);
+    const code = checkKey("jev-glm");
+    return code ?? execute(command, args);
   }
 
   const proxy = await startGlmProxy({

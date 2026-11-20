@@ -9,6 +9,7 @@ export const CHECKPOINT_REF_PREFIX = "refs/jev/checkpoints";
 export const DEFAULT_MAX_FILE_BYTES = 100 * 1024 * 1024;
 const LIST_LIMIT = 1000;
 const SNAPSHOT_ATTEMPTS = 2;
+const UNREADABLE_RETRIES = 50;
 const IDENTITY = {
   GIT_AUTHOR_NAME: "jev-checkpoint",
   GIT_AUTHOR_EMAIL: "jev-checkpoint@localhost",
@@ -191,6 +192,33 @@ async function gitOk(git, args, opts, code = "git_failed") {
   return result.stdout;
 }
 
+const DENIED = "(?:Operation not permitted|Permission denied)";
+const UNREADABLE = [
+  new RegExp(`^warning: could not open directory '(.+?)/?': ${DENIED}$`),
+  new RegExp(`^fatal: unable to stat '(.+)': ${DENIED}$`),
+  new RegExp(`^error: open\\("(.+)"\\): ${DENIED}$`),
+  new RegExp(`^(?!warning: |error: |fatal: )(.+): ${DENIED}$`),
+];
+
+/**
+ * Paths git reported it could not read. A macOS sandbox (or a mode-000 directory) makes
+ * `git add -A` die with "unable to stat"; those paths are skipped and reported rather than
+ * failing the whole checkpoint, since this process could not read or change them anyway.
+ */
+export function unreadablePaths(stderr) {
+  const out = new Set();
+  for (const line of String(stderr).split("\n")) {
+    for (const pattern of UNREADABLE) {
+      const match = pattern.exec(line.trimEnd());
+      if (match) {
+        out.add(match[1].replace(/\/+$/, ""));
+        break;
+      }
+    }
+  }
+  return [...out];
+}
+
 async function resolveHead(git, top) {
   const head = await git(["rev-parse", "--verify", "-q", "HEAD^{commit}"], { cwd: top });
   const branch = await git(["symbolic-ref", "-q", "HEAD"], { cwd: top });
@@ -245,9 +273,12 @@ async function snapshot({ git, repo, taskId, reason, sensitive, acknowledgeUncov
   const indexFile = join(gitDir, "index");
   const before = { ...(await resolveHead(git, top)), index: fileDigest(indexFile) };
   const acknowledged = new Set(acknowledgeUncovered.map((path) => String(path).replace(/\/+$/, "")));
-  const status = parseStatus(
-    await gitOk(git, ["status", "--porcelain=v2", "-z", "--no-renames", "--untracked-files=all", "--ignore-submodules=none"], { cwd: top }),
-  );
+  const statusRun = await git(["status", "--porcelain=v2", "-z", "--no-renames", "--untracked-files=all", "--ignore-submodules=none"], { cwd: top });
+  if (statusRun.code !== 0) {
+    throw new CheckpointError("git_failed", `git status failed: ${statusRun.stderr.trim() || `exit ${statusRun.code}`}.`);
+  }
+  const status = parseStatus(statusRun.stdout);
+  const unreadable = unreadablePaths(statusRun.stderr);
 
   if (status.unmerged.length) {
     throw new CheckpointError("unmerged_index", "The index has unresolved merge conflicts, so the staged state cannot be recorded.", {
@@ -343,6 +374,14 @@ async function snapshot({ git, repo, taskId, reason, sensitive, acknowledgeUncov
     "file exceeds checkpoint size limit",
   );
 
+  const markUnreadable = (paths) => {
+    for (const path of paths) {
+      if (!excluded.some((entry) => entry.path === path)) excluded.push({ path, reason: "unreadable here (permission denied); not captured" });
+      if (!unreadable.includes(path)) unreadable.push(path);
+    }
+  };
+  markUnreadable(unreadable);
+
   const tag = `${process.pid}-${randomBytes(4).toString("hex")}`;
   const indexCopy = join(gitDir, `jev-checkpoint-index-${tag}`);
   const worktreeCopy = join(gitDir, `jev-checkpoint-worktree-${tag}`);
@@ -360,8 +399,20 @@ async function snapshot({ git, repo, taskId, reason, sensitive, acknowledgeUncov
       }
     }
     const indexTree = (await gitOk(git, ["write-tree"], { cwd: top, env: { GIT_INDEX_FILE: indexCopy } })).trim();
-    const pathspec = [".", ...excluded.map(({ path }) => `:(top,exclude,literal)${path}`)];
-    const addAll = () => gitOk(git, ["add", "-A", "--", ...pathspec], { cwd: top, env: { GIT_INDEX_FILE: worktreeCopy } }, "add_failed");
+    const addAll = async () => {
+      // Each failed pass names the paths git could not read; skip them and try again. A
+      // failure that names no new unreadable path is a real error.
+      for (let attempt = 0; ; attempt++) {
+        const pathspec = [".", ...excluded.map(({ path }) => `:(top,exclude,literal)${path}`)];
+        const result = await git(["add", "-A", "--", ...pathspec], { cwd: top, env: { GIT_INDEX_FILE: worktreeCopy } });
+        if (result.code === 0) return;
+        const fresh = unreadablePaths(result.stderr).filter((path) => !excluded.some((entry) => entry.path === path));
+        if (!fresh.length || attempt >= UNREADABLE_RETRIES) {
+          throw new CheckpointError("add_failed", `git add failed: ${result.stderr.trim() || `exit ${result.code}`}.`);
+        }
+        markUnreadable(fresh);
+      }
+    };
     const writeTree = async () => (await gitOk(git, ["write-tree"], { cwd: top, env: { GIT_INDEX_FILE: worktreeCopy } })).trim();
     await addAll();
     const worktreeTree = await writeTree();
@@ -375,7 +426,12 @@ async function snapshot({ git, repo, taskId, reason, sensitive, acknowledgeUncov
       });
     }
 
-    const skip = new Set(excluded.map(({ path }) => path));
+    const skipSet = new Set(excluded.map(({ path }) => path));
+    // An unreadable directory covers everything below it.
+    const skip = { has: (path) => skipSet.has(path) || unreadable.some((dir) => path.startsWith(`${dir}/`)) };
+    if (unreadable.length) {
+      warnings.push(`${unreadable.length} unreadable path(s) were skipped and are not protected: ${unreadable.slice(0, 5).join(", ")}${unreadable.length > 5 ? ", ..." : ""}`);
+    }
     const listed = new Set(
       (await gitOk(git, ["ls-tree", "-r", "-z", "--name-only", worktreeTree], { cwd: top })).split("\0").filter(Boolean),
     );
@@ -406,6 +462,7 @@ async function snapshot({ git, repo, taskId, reason, sensitive, acknowledgeUncov
       worktreeTree,
       files: summarize({ changed: status.changed, deleted: status.deleted, untracked: status.untracked }, skip),
       excluded,
+      unreadable,
       ignored: { count: ignoredList.length, covered: false, sample: ignoredList.slice(0, 20) },
       sensitive: sensitive === "exclude" ? [] : secrets,
       submodules: status.submodules,
@@ -432,6 +489,7 @@ async function snapshot({ git, repo, taskId, reason, sensitive, acknowledgeUncov
       `Jev-Head: ${before.head ?? "unborn"}`,
       `Jev-Branch: ${before.branch ?? "detached"}`,
       `Jev-Excluded: ${excluded.length}`,
+      `Jev-Unreadable: ${unreadable.length}`,
     ].join("\n");
     const commit = (
       await gitOk(git, ["commit-tree", worktreeTree, ...headParents, "-p", indexCommit, "-F", "-"], { cwd: top, env, input: message })

@@ -145,13 +145,13 @@ Each fresh decision is the first line of the answer. It appears as soon as Jev d
 (about 0.5 s), before the model's first token, which can take much longer:
 
 ```text
-[Jev] routed this turn to gemini-3.1-pro-low (jev, confidence 0.32).
+[Jev] routed this turn to gemini-4-argon-low (jev, confidence 0.32).
 ```
 
-Jev chooses among the exact Gemini IDs in the signed-in account's agent picker, such as
-`gemini-3.8-flash-low`, `gemini-3.1-pro-low`, or `gemini-pro-agent`. AGY routing currently
-covers Gemini models only: Claude is excluded because Claude through AGY rejects replayed
-thinking parts that lack signatures.
+Jev chooses only **Gemini 3.8 Flash** and **Gemini 4 Argon** from the signed-in account's
+agent picker (`gemini-3.8-flash-{low,medium,high}` and
+`gemini-4-argon-{low,medium,high}`). Older Gemini models, Claude and GPT-OSS are excluded
+from automatic routing. Explicit native model selections remain manual overrides.
 AGY encodes the thinking level in the ID (`-low`, `-medium`, `-high`), so the chosen ID also
 sets the effort. Tool continuations keep the turn's model. Jev's notes are removed from the
 conversation history before each request, so the model never reads them.
@@ -293,6 +293,9 @@ may also remove them during normal temporary-file cleanup.
 ![Jev Router in the OpenAI Codex model picker](docs/codex-model-picker.png)
 
 `jev-codex` launches Codex with a temporary **Jev Router** provider and selects `jev-router`.
+It starts in standard speed with Auto reasoning. Choose **Jev Router Ultrafast**
+in `/model` (or launch with `jev-codex --model jev-router-ultrafast`) to opt in.
+That entry appears only when the account catalog has an eligible Ultrafast model.
 The native `/model` picker still contains the models available to the account. Selecting a
 concrete model pauses routing; selecting **Jev Router** resumes it.
 
@@ -319,8 +322,10 @@ fallback model and explains how to set `JEV_API_KEY`.
 
 ## How it works
 
-Each command starts a loopback proxy, launches the real CLI, and forwards the CLI's existing
-authorization headers without reading, storing, or modifying them.
+Each command starts a loopback proxy and launches the real CLI. Claude and AGY authorization
+headers are forwarded unchanged. For Codex ChatGPT login, the proxy may replace an expired
+bearer with the current token in `CODEX_HOME/auth.json`, but only when both account ids match;
+it never reads an API key or stores a copied credential.
 
 ```text
 you -> Claude Code -> jev-claude proxy -> Anthropic
@@ -370,6 +375,7 @@ sub-agents are pinned separately. Routing is fail-open: Jev failure never blocks
 | Variable | Interface | Effect |
 | --- | --- | --- |
 | `JEV_API_KEY` | All | Enables routing. `TYPESAFE_API_KEY` also works. |
+| `JEV_REQUIRE` | All | With `1`, exit with code 3 instead of starting unrouted when no key is found. |
 | `JEV_ALLOW_FABLE` | All | Enables the opt-in long tier. |
 | `JEV_DEBUG` | All | Logs decisions and rewrites to `~/.jev-claude.log` in interactive sessions. |
 | `JEV_DUMP` | All | Dumps request bodies for debugging wire-format changes. |
@@ -379,9 +385,13 @@ sub-agents are pinned separately. Routing is fail-open: Jev failure never blocks
 | `JEV_CODEX_STRONG_MODEL` | Codex | Strong model; defaults to `gpt-5.6-sol`. |
 | `JEV_CODEX_LONG_MODEL` | Codex | Long model; defaults to `gpt-6-astra`. |
 
-Existing environment variables have highest precedence, followed by `~/.jev-router.env` and
-the legacy `~/.jev-claude.env`. A `.env` in the launch directory is not read, so a cloned
-repository cannot redirect upstream URLs or replace your key.
+Existing environment variables have highest precedence, followed by `~/.jev-router.env`, the
+legacy `~/.jev-claude.env`, and on macOS the Keychain item `typesafe-ai-api`
+(`security find-generic-password -s typesafe-ai-api -w`), so launchers exec'd by scripts or
+terminal managers still route. A `.env` in the launch directory is not read, so a cloned
+repository cannot redirect upstream URLs or replace your key. Without a key, every launcher
+prints a multi-line `JEV ROUTER OFF` warning and the Claude status line shows
+`Jev Router OFF: no key`.
 
 Tier definitions, Jev's question, confidence thresholds, and timeouts live in `src/config.mjs`.
 Both launchers send Jev the exact models in the signed-in account's native catalog, so model

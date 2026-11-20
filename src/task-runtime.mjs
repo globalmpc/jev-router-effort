@@ -122,7 +122,18 @@ export function createTaskRuntime({ cli, route, cwd = process.cwd(), workspaceEr
           maxFileBytes: options.maxFileBytes, cwd, taskId: task.id, reason: `JEV ${profile.taskType}: ${profile.signals.join(', ')}` });
         if (!task.checkpoint?.ok || !task.checkpoint.commit || !task.checkpoint.ref) throw new Error('Incomplete checkpoint receipt');
         save(fileFor(taskKey), task);
-      } catch (err) { throw new RoutingHoldError(`Checkpoint required before execution: ${err.message}`); }
+      } catch (err) {
+        // Intend.md item 5: a required checkpoint that cannot be made holds execution. The
+        // user may opt out for local execution only (checkpointOptions.onFailure = "warn");
+        // a handoff always needs a receipt.
+        if ((config.checkpointOptions?.onFailure ?? 'hold') === 'warn' && !willDelegate) {
+          task.checkpoint = { ok: false, error: err.message, code: err.code ?? null, at: now() };
+          save(fileFor(taskKey), task);
+        } else {
+          throw new RoutingHoldError(`Checkpoint required before execution: ${err.message}` +
+            (willDelegate ? '' : ' To continue without one, set checkpointOptions.onFailure to "warn" in the runtime config.'));
+        }
+      }
     }
     const override = detectOverride(input.prompt);
     if (!override && choice.kind === 'local') {
@@ -176,7 +187,8 @@ export function createTaskRuntime({ cli, route, cwd = process.cwd(), workspaceEr
       // Do not silently replace a known-bad choice with another unproven candidate.
       throw new RoutingHoldError('Selected model is excluded by validated task evidence; no compatible verified replacement is available');
     }
-    if (answer) answer = { ...answer, taskContext, checkpoint: task.checkpoint ?? null };
+    // Only the turn that tried to take a checkpoint reports it; a later read-only turn has none of its own.
+    if (answer) answer = { ...answer, taskContext, checkpoint: needsCheckpoint ? task.checkpoint ?? null : null };
     append('decisions.jsonl', { at: now(), taskId: task.id, cli, taskType: profile.taskType, proposedModel: answer?.choice ?? null,
       proposedEffort: answer?.effort ?? null, evidence: answer?.evidence ?? null, checkpoint: task.checkpoint?.commit ?? null });
     return answer;
@@ -204,6 +216,13 @@ export function createTaskRuntime({ cli, route, cwd = process.cwd(), workspaceEr
       return pending;
     },
   };
+}
+
+/** Suffix for the per-turn note when warn mode let a turn run without its checkpoint. */
+export function checkpointWarning(checkpoint) {
+  if (checkpoint?.ok !== false) return '';
+  // The error can quote repository paths; control characters would reach the user's terminal.
+  return ` Checkpoint FAILED, no recovery point for this turn: ${String(checkpoint.error ?? 'unknown error').replace(/[\s\x00-\x1f\x7f-\x9f]+/g, ' ').slice(0, 200)}`;
 }
 
 export function sendRoutingHold(res, error) {

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { ensureCheckpoint, isSensitivePath, parseStatus, runGit } from "../src/checkpoint.mjs";
 
 // Every repository here is a disposable directory under the OS temp dir.
@@ -309,4 +309,104 @@ test("porcelain v2 parsing handles spaces, submodules and nested repositories", 
   assert.deepEqual(parsed.nested, ["nested"]);
   assert.deepEqual(parsed.unmerged, ["conflict.txt"]);
   assert.deepEqual(parsed.submodules, [{ path: "sub", commitChanged: false, modified: true, untracked: false }]);
+});
+
+// 2026-10-18: sandboxed sessions could not read some repo paths, `git add -A` died with
+// "fatal: unable to stat", and every clean-room lane stopped on a 409.
+import { chmodSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { unreadablePaths } from "../src/checkpoint.mjs";
+
+test("unreadablePaths reads git's permission errors and nothing else", () => {
+  const stderr = [
+    "warning: could not open directory 'plan/review/': Operation not permitted",
+    "plan/confirmations.json: Operation not permitted",
+    'error: open("plan/readdeny.txt"): Operation not permitted',
+    "error: unable to index file 'plan/readdeny.txt'",
+    "fatal: unable to stat 'plan/untracked-deny': Operation not permitted",
+    "fatal: unable to stat 'x': No such file or directory",
+    "warning: could not open directory 'old/': Permission denied",
+  ].join("\n");
+  assert.deepEqual(unreadablePaths(stderr), ["plan/review", "plan/confirmations.json", "plan/readdeny.txt", "plan/untracked-deny", "old"]);
+});
+
+test("git add failing on unreadable paths still yields a checkpoint of the rest", async (t) => {
+  const dir = repo(t);
+  writeFileSync(join(dir, "a.txt"), "edited\n");
+  writeFileSync(join(dir, "denied.txt"), "x\n");
+  const before = state(dir);
+  let failed = 0;
+  const fake = async (args, opts) => {
+    if (args[0] === "add" && !args.includes(":(top,exclude,literal)denied.txt")) {
+      failed++;
+      return { code: 128, stdout: "", stderr: "fatal: unable to stat 'denied.txt': Operation not permitted\n" };
+    }
+    return runGit(args, opts);
+  };
+  const receipt = await ensureCheckpoint({ cwd: dir, taskId: "unreadable", reason: "test", git: fake });
+  assert.equal(receipt.ok, true);
+  assert.equal(failed, 1);
+  assert.deepEqual(receipt.unreadable, ["denied.txt"]);
+  assert.ok(receipt.excluded.some((e) => e.path === "denied.txt" && /unreadable/.test(e.reason)));
+  assert.ok(receipt.warnings.some((w) => /unreadable path/.test(w)));
+  assert.equal(git(dir, "show", `${receipt.commit}:a.txt`), "edited");
+  assert.match(git(dir, "log", "-1", "--format=%B", receipt.commit), /Jev-Unreadable: 1/);
+  assert.deepEqual(state(dir), before);
+});
+
+test("a git add failure that names no unreadable path still refuses", async (t) => {
+  const dir = repo(t);
+  writeFileSync(join(dir, "a.txt"), "edited\n");
+  const fake = async (args, opts) =>
+    args[0] === "add" ? { code: 128, stdout: "", stderr: "fatal: something else broke\n" } : runGit(args, opts);
+  await assert.rejects(ensureCheckpoint({ cwd: dir, taskId: "broken", reason: "test", git: fake }), (err) => err.code === "add_failed");
+});
+
+test("a mode-000 directory is skipped and listed", { skip: process.getuid?.() === 0 }, async (t) => {
+  const dir = repo(t);
+  mkdirSync(join(dir, "locked"));
+  writeFileSync(join(dir, "locked", "f.txt"), "x\n");
+  writeFileSync(join(dir, "a.txt"), "edited\n");
+  chmodSync(join(dir, "locked"), 0o000);
+  let receipt;
+  try {
+    receipt = await ensureCheckpoint({ cwd: dir, taskId: "mode000", reason: "test" });
+  } finally {
+    chmodSync(join(dir, "locked"), 0o755); // before the temp-dir cleanup hook runs
+  }
+  assert.equal(receipt.ok, true);
+  assert.ok(receipt.unreadable.includes("locked"));
+  assert.equal(git(dir, "show", `${receipt.commit}:a.txt`), "edited");
+});
+
+// The real failure: a macOS sandbox denying reads under the repository.
+const sandboxExec = process.platform === "darwin" && spawnSync("/usr/bin/sandbox-exec", ["-n", "no-network", "/usr/bin/true"]).status === 0;
+test("a checkpoint inside a macOS sandbox that denies some repo paths succeeds", { skip: !sandboxExec }, async (t) => {
+  const dir = execFileSync("realpath", [repo(t)], { encoding: "utf8" }).trim();
+  mkdirSync(join(dir, "plan", "review"), { recursive: true });
+  writeFileSync(join(dir, "plan", "review", "a.md"), "a\n");
+  writeFileSync(join(dir, "plan", "confirmations.json"), "{}\n");
+  git(dir, "add", ".");
+  git(dir, "commit", "-q", "-m", "plan");
+  writeFileSync(join(dir, "plan", "review", "b.md"), "new\n");
+  writeFileSync(join(dir, "plan", "untracked.json"), "{}\n");
+  writeFileSync(join(dir, "a.txt"), "edited\n");
+  const before = state(dir);
+  const profile = `(version 1)(allow default)(deny file-read* (subpath "${dir}/plan/review"))` +
+    `(deny file-read* (literal "${dir}/plan/confirmations.json"))(deny file-read* (literal "${dir}/plan/untracked.json"))`;
+  const module = new URL("../src/checkpoint.mjs", import.meta.url).href;
+  const script = `const { ensureCheckpoint } = await import(${JSON.stringify(module)});
+    try { process.stdout.write(JSON.stringify(await ensureCheckpoint({ cwd: ${JSON.stringify(dir)}, taskId: "sandbox", reason: "test" }))); }
+    catch (e) { process.stdout.write(JSON.stringify({ ok: false, code: e.code, message: e.message })); }`;
+  const run = spawnSync("/usr/bin/sandbox-exec", ["-p", profile, process.execPath, "--input-type=module", "-e", script], {
+    cwd: dirname(fileURLToPath(import.meta.url)), encoding: "utf8",
+  });
+  const receipt = JSON.parse(run.stdout || "{}");
+  assert.equal(receipt.ok, true, run.stdout + run.stderr);
+  for (const path of ["plan/review", "plan/untracked.json"]) assert.ok(receipt.unreadable.includes(path), path);
+  assert.equal(git(dir, "show", `${receipt.commit}:a.txt`), "edited");
+  // A tracked file that could not be read keeps its committed content, never a deletion.
+  assert.equal(git(dir, "show", `${receipt.commit}:plan/confirmations.json`), "{}");
+  assert.deepEqual(state(dir), before);
 });

@@ -1,11 +1,12 @@
-import { execFileSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { accessSync, constants, copyFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { CODEX_AUTO_EFFORT, CODEX_AUTO_MODEL, startCodexProxy } from "./codex-proxy.mjs";
+import { CODEX_AUTO_EFFORT, CODEX_AUTO_MODEL, isCodexRouterModel, startCodexProxy } from "./codex-proxy.mjs";
 import { childEnv } from "./child-env.mjs";
 import { executionWorkspace } from './execution-workspace.mjs';
+import { checkKey, loadJevKey, userEnvFiles } from "./credentials.mjs";
 
 const PROVIDER = "jev";
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -18,35 +19,12 @@ export function installCodexSkill(home = homedir()) {
   return target;
 }
 
-/**
- * User-level env files, in precedence order. A `.env` in the launch directory is deliberately
- * not read: it belongs to whatever repository the user opened, and could redirect upstream
- * URLs such as CLOUD_CODE_URL or ZAI_BASE_URL together with the user's credentials.
- */
-export function userEnvFiles(home = homedir()) {
-  return [join(home, ".jev-router.env"), join(home, ".jev-claude.env")];
-}
+// Re-exported for existing importers; the rule itself lives in credentials.mjs.
+export { userEnvFiles };
 
+/** Loads the user's env files and, on macOS, the Keychain key. See `loadJevKey` for the order. */
 export function loadEnv(home = homedir()) {
-  for (const file of userEnvFiles(home)) {
-    try {
-      process.loadEnvFile(file);
-    } catch {
-      // Missing or unreadable; values may still come from the real environment.
-    }
-  }
-  // The shared Jev CLI can store its credential in macOS Keychain. Keep it out
-  // of shell history and plaintext files; explicit environment settings win.
-  if (!process.env.JEV_API_KEY && !process.env.TYPESAFE_API_KEY && process.platform === "darwin") {
-    try {
-      const key = execFileSync("security", ["find-generic-password", "-s", "typesafe-ai-api", "-w"], {
-        encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 3000,
-      }).trim();
-      if (key) process.env.TYPESAFE_API_KEY = key;
-    } catch {
-      // Keep the existing unauthenticated fallback if Keychain is unavailable.
-    }
-  }
+  return loadJevKey({ files: userEnvFiles(home) });
 }
 
 export function resolveCodex() {
@@ -78,8 +56,8 @@ export const codexArgs = (baseURL, args) => {
     : inlineModel?.slice(inlineModel.indexOf("=") + 1);
   return [
   ...(selectedModel ? [] : ["--model", CODEX_AUTO_MODEL]),
-  ...(!selectedModel || selectedModel === CODEX_AUTO_MODEL
-    ? ["--config", `model_reasoning_effort="${CODEX_AUTO_EFFORT}"`]
+  ...(!selectedModel || isCodexRouterModel(selectedModel)
+    ? ["--config", `model_reasoning_effort="${CODEX_AUTO_EFFORT}"`, "--config", 'service_tier="default"']
     : []),
   "--config",
   `model_provider="${PROVIDER}"`,
@@ -128,10 +106,11 @@ export async function runCodex() {
     close = proxy.close;
     args = codexArgs(`http://127.0.0.1:${proxy.port}`, args);
   } else {
-    process.stderr.write(
-      "[jev] no JEV_API_KEY found - starting Codex without routing\n" +
-        `[jev] add JEV_API_KEY=... to ${join(homedir(), ".jev-router.env")} and restart jev-codex\n`,
-    );
+    const code = checkKey("jev-codex");
+    if (code != null) {
+      process.exitCode = code;
+      return;
+    }
   }
 
   const childArgs = [...command.prefix, ...args];

@@ -29,7 +29,7 @@ injectable `git` runner for tests.
 
 `{ ok: true, taskId, reason, cwd, commit, indexCommit, ref, head, branch, indexTree,
 worktreeTree, createdAt, reused, files: { count, changed, deleted, untracked, truncated },
-excluded: [{ path, reason }], ignored: { count, covered: false, sample }, sensitive,
+excluded: [{ path, reason }], unreadable: [path], ignored: { count, covered: false, sample }, sensitive,
 submodules, warnings, coverage }`
 
 `reused: true` only when the task's newest checkpoint has the same `HEAD`, staged tree and
@@ -52,6 +52,18 @@ working tree. A matching task id alone is never enough.
 | `coverage_verify_failed`, `ref_create_failed`, `ref_verify_failed`, `add_failed` | the result could not be proven | do not start complex execution |
 
 Any refusal means complex execution must not start.
+
+Paths this process cannot read (`Operation not permitted` from a macOS sandbox, `Permission
+denied` from file modes) are not a refusal. Git's messages from `status` and each failed `add`
+pass name them; they are excluded, the add is retried, and they are listed in `unreadable`,
+`excluded` (reason "unreadable here") and a warning, and counted in the commit's
+`Jev-Unreadable:` trailer. A tracked unreadable file keeps its index version in the snapshot,
+never a deletion. An `add` failure that names no new unreadable path is still `add_failed`.
+
+The runtime turns any refusal into a held request (HTTP 409) by default, as `Intend.md` item 5
+requires. `checkpointOptions.onFailure: "warn"` in the runtime configuration lets local
+execution continue instead, and the per-turn note then ends with `Checkpoint FAILED, no recovery
+point for this turn: <error>`. A cross-CLI handoff always needs a receipt and stays held.
 
 Screening covers the staged index as well as the working tree: a file staged and then deleted
 from disk still reaches the index commit, so it is checked too. An excluded credential file and

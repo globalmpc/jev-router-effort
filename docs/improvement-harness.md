@@ -61,7 +61,7 @@ An explicitly requested evaluation preference may also select an external execut
 
 This example is a configuration shape, not availability or quality evidence. `null` is the native CLI default and must be listed explicitly by the actual checked catalog. The target must also appear in `externalModels`. Only conservative evaluation requests (English evaluate/review/QA/grade or their Korean equivalents) match; implementation and review in the same request remain local. A later evaluation request overrides the implementation profile for that turn while preserving the original objective. Manual model or effort choices prevent new automatic external selection. Validated avoidance evidence vetoes the preference. A persisted handoff's `selection.kind` distinguishes `user-preference` from `outcome-evidence`; preference records have no fabricated samples or success confidence. The distributable policy remains separate and unchanged.
 
-Availability evidence expires after 24 hours and must be refreshed from the native CLI before use; stale entries are skipped, never renewed just by copying today's date. `checkpointOptions` may explicitly set `sensitive`, `acknowledgeUncovered` or `maxFileBytes` as documented by the checkpoint API. Any exclusions leave those paths unprotected.
+Availability evidence expires after 24 hours and must be refreshed from the native CLI before use; stale entries are skipped, never renewed just by copying today's date. `checkpointOptions` may explicitly set `sensitive`, `acknowledgeUncovered`, `maxFileBytes` or `onFailure` (`"hold"` default, `"warn"` to continue local execution with a note warning) as documented in `docs/execution-safeguards.md`. Any exclusions leave those paths unprotected.
 
 ## Execution contract
 

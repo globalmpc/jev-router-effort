@@ -5,18 +5,18 @@ import { mkdirSync, mkdtempSync, rmSync, truncateSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
-  addAgyJevModel, agyDescribeModel, agyImagePaths, agyImageType, agyModels, agyNewTurnPrompt, agyPromptWithImages, agyTierOf,
+  addAgyJevModel, agyDecisionText, agyDescribeModel, agyImagePaths, agyImageType, agyModels, agyNewTurnPrompt, agyPromptWithImages, agyTierOf,
   applyAgyModel, attachAgyImages, describeAgyImages, startAgyProxy, stripAgyNotes,
 } from "../src/agy-proxy.mjs";
 import { readStatus, STATUS_DIR } from "../src/status.mjs";
 
-// Trimmed from a real `v1internal:fetchAvailableModels` reply (AGY 1.2.12).
+// Catalog-shaped fixture; current Argon IDs verified with `agy models` on 2026-10-16.
 const CATALOG = {
   models: {
     "gemini-3.8-flash-high": { displayName: "Gemini 3.8 Flash (High)", model: "M318", thinkingBudget: 8000, maxOutputTokens: 65536, supportsImages: true },
     "gemini-3.8-flash-low": { displayName: "Gemini 3.8 Flash (Low)", model: "M320", thinkingBudget: 1000, maxOutputTokens: 65536, supportsImages: true },
-    "gemini-3.1-pro-high": { displayName: "Gemini 3.1 Pro (High)", model: "M37" },
-    "gemini-3.1-pro-low": { displayName: "Gemini 3.1 Pro (Low)", model: "M36", thinkingBudget: 1001, maxOutputTokens: 65535 },
+    "gemini-4-argon-high": { displayName: "Gemini 4 Argon (High)", model: "M37" },
+    "gemini-4-argon-low": { displayName: "Gemini 4 Argon (Low)", model: "M36", thinkingBudget: 1001, maxOutputTokens: 65535 },
     "claude-sonnet-4-6": { displayName: "Claude Sonnet 4.6 (Thinking)", model: "M36", thinkingBudget: 1024, maxOutputTokens: 64000 },
     "claude-opus-4-6-thinking": { displayName: "Claude Opus 4.6 (Thinking)", model: "M26", thinkingBudget: 1024, maxOutputTokens: 64000 },
     "gemini-3.5-flash-lite": { displayName: "Lite", model: "M50", supportsImages: true },
@@ -25,9 +25,9 @@ const CATALOG = {
   tieredModelIds: { flashLite: ["gemini-3.5-flash-lite"] },
   defaultAgentModelId: "gemini-3.8-flash-high",
   agentModelSorts: [{ displayName: "Recommended", groups: [{ modelIds: [
-    "gemini-3.8-flash-high", "gemini-3.8-flash-low", "gemini-3.1-pro-low", "claude-sonnet-4-6", "claude-opus-4-6-thinking",
+    "gemini-3.8-flash-high", "gemini-3.8-flash-low", "gemini-4-argon-low", "claude-sonnet-4-6", "claude-opus-4-6-thinking",
   ] }] }],
-  deprecatedModelIds: { "gemini-3.1-pro-high": { newModelId: "gemini-pro-agent" } },
+  deprecatedModelIds: { "gemini-4-argon-high": { newModelId: "gemini-pro-agent" } },
 };
 
 const turn = (text, extra = []) => ({
@@ -47,7 +47,7 @@ const continuation = () => ({
     ...turn("ignored").request,
     contents: [
       { role: "user", parts: [{ text: "<USER_REQUEST>\nlist files\n</USER_REQUEST>" }] },
-      { role: "model", parts: [{ text: "[Jev] routed this turn to gemini-3.1-pro-low (jev, confidence 0.90).\n\n" }, { functionCall: { name: "list_dir" } }] },
+      { role: "model", parts: [{ text: "[Jev] routed this turn to gemini-4-argon-low (jev, confidence 0.90).\n\n" }, { functionCall: { name: "list_dir" } }] },
       { role: "user", parts: [{ functionResponse: { name: "list_dir", response: {} } }] },
     ],
   },
@@ -57,12 +57,28 @@ test("maps picker models to tiers, skipping deprecated and non-agent entries", (
   assert.deepEqual(agyModels(CATALOG).map((m) => [m.id, m.tier]), [
     ["gemini-3.8-flash-high", "haiku"],
     ["gemini-3.8-flash-low", "haiku"],
-    ["gemini-3.1-pro-low", "opus"],
+    ["gemini-4-argon-low", "opus"],
   ]);
   assert.equal(agyTierOf("claude-sonnet-4-6"), null, "Claude is never routed");
   assert.equal(agyTierOf("gpt-oss-120b-medium"), null);
-  assert.equal(agyTierOf("gemini-pro-agent"), "opus");
+  assert.equal(agyTierOf("gemini-pro-agent"), null);
+  for (const effort of ["low", "medium", "high"]) {
+    assert.equal(agyTierOf(`gemini-4-argon-${effort}`), "opus");
+    assert.equal(agyTierOf(`gemini-3.8-flash-${effort}`), "haiku");
+  }
+  for (const id of ["gemini-3.1-pro-low", "gemini-3.5-flash-high", "gemini-4-argon-agent"]) {
+    assert.equal(agyTierOf(id), null, "unapproved families/efforts are excluded");
+  }
   assert.equal(agyTierOf("../../oops"), null);
+});
+
+test("retired Gemini models in the native picker are excluded from automatic candidates", () => {
+  const catalog = structuredClone(CATALOG);
+  for (const id of ["gemini-3.1-pro-low", "gemini-pro-agent", "gemini-3.5-flash-high"]) {
+    catalog.models[id] = { displayName: id };
+    catalog.agentModelSorts[0].groups[0].modelIds.push(id);
+  }
+  assert.deepEqual(agyModels(catalog), agyModels(CATALOG));
 });
 
 test("adds a Jev Router row to the native picker without touching real entries", () => {
@@ -80,8 +96,8 @@ test("detects new turns and ignores tool continuations", () => {
 });
 
 test("copies catalog-derived fields when switching model", () => {
-  const body = applyAgyModel(turn("x"), "gemini-3.1-pro-low", CATALOG.models["gemini-3.1-pro-low"]);
-  assert.equal(body.model, "gemini-3.1-pro-low");
+  const body = applyAgyModel(turn("x"), "gemini-4-argon-low", CATALOG.models["gemini-4-argon-low"]);
+  assert.equal(body.model, "gemini-4-argon-low");
   assert.equal(body.request.labels.model_enum, "M36");
   assert.equal(body.request.labels.used_claude, "false");
   assert.equal(body.request.labels.used_non_gemini_model, "false");
@@ -137,7 +153,7 @@ async function post(port, path, body) {
 test("routes each new turn, pins continuations and passes manual models through", async (t) => {
   const upstream = await fakeUpstream(t);
   const asked = [];
-  const answers = ["gemini-3.1-pro-low", "gemini-3.8-flash-low"];
+  const answers = ["gemini-4-argon-low", "gemini-3.8-flash-low"];
   const proxy = await startAgyProxy({
     upstream: upstream.url,
     route: async ({ prompt, models }) => {
@@ -151,10 +167,10 @@ test("routes each new turn, pins continuations and passes manual models through"
   assert.equal(catalog.agentModelSorts[0].groups[0].modelIds[0], "jev-router");
 
   const first = await post(proxy.port, "/v1internal:streamGenerateContent?alt=sse", turn("refactor the auth module"));
-  assert.match(first.text, /^data: .*\[Jev\] routed this turn to gemini-3.1-pro-low \(jev, confidence 0\.90\)/);
+  assert.match(first.text, /^data: .*\[Jev\] routed this turn to gemini-4-argon-low \(jev, confidence 0\.90\)/);
   assert.match(first.text, /"text": "ok"/);
   let sent = upstream.seen.at(-1);
-  assert.equal(sent.body.model, "gemini-3.1-pro-low");
+  assert.equal(sent.body.model, "gemini-4-argon-low");
   assert.equal(sent.body.request.labels.model_enum, "M36");
   assert.equal(sent.headers.authorization, "Bearer secret", "auth is forwarded untouched");
   assert.equal(sent.headers["accept-encoding"], undefined);
@@ -162,17 +178,17 @@ test("routes each new turn, pins continuations and passes manual models through"
   const tool = await post(proxy.port, "/v1internal:streamGenerateContent?alt=sse", continuation());
   assert.doesNotMatch(tool.text, /\[Jev\]/);
   sent = upstream.seen.at(-1);
-  assert.equal(sent.body.model, "gemini-3.1-pro-low", "continuation keeps the turn's model");
+  assert.equal(sent.body.model, "gemini-4-argon-low", "continuation keeps the turn's model");
   assert.equal(JSON.stringify(sent.body).includes("[Jev]"), false, "notes never reach the model");
   assert.equal(asked.length, 1, "continuations do not ask Jev");
 
   await post(proxy.port, "/v1internal:streamGenerateContent?alt=sse", turn("rename a variable"));
   assert.equal(upstream.seen.at(-1).body.model, "gemini-3.8-flash-low");
-  assert.equal(asked[1].models.includes("gemini-3.1-pro-high"), false, "deprecated ids are never offered");
+  assert.equal(asked[1].models.includes("gemini-4-argon-high"), false, "deprecated ids are never offered");
 
-  const manual = await post(proxy.port, "/v1internal:streamGenerateContent?alt=sse", { ...turn("hi"), model: "gemini-3.1-pro-low" });
+  const manual = await post(proxy.port, "/v1internal:streamGenerateContent?alt=sse", { ...turn("hi"), model: "gemini-4-argon-low" });
   assert.doesNotMatch(manual.text, /\[Jev\]/);
-  assert.equal(upstream.seen.at(-1).body.model, "gemini-3.1-pro-low");
+  assert.equal(upstream.seen.at(-1).body.model, "gemini-4-argon-low");
   assert.equal(asked.length, 2);
 });
 
@@ -206,7 +222,7 @@ test("shows the decision before a slow upstream sends its first byte", async (t)
   t.after(() => server.close());
   const proxy = await startAgyProxy({
     upstream: `http://127.0.0.1:${server.address().port}`,
-    route: async () => ({ choice: "gemini-3.1-pro-low", confidence: 0.9 }),
+    route: async () => ({ choice: "gemini-4-argon-low", confidence: 0.9 }),
   });
   t.after(proxy.close);
   await post(proxy.port, "/v1internal:fetchAvailableModels", {});
@@ -219,7 +235,7 @@ test("shows the decision before a slow upstream sends its first byte", async (t)
   const reader = res.body.getReader();
   const first = new TextDecoder().decode((await reader.read()).value);
   assert.ok(Date.now() - started < 1000, "decision arrives before the upstream's first byte");
-  assert.match(first, /\[Jev\] routed this turn to gemini-3.1-pro-low/);
+  assert.match(first, /\[Jev\] routed this turn to gemini-4-argon-low/);
   let rest = "";
   for (let chunk = await reader.read(); !chunk.done; chunk = await reader.read()) rest += new TextDecoder().decode(chunk.value);
   assert.match(rest, /"text": "late"/);
@@ -247,7 +263,7 @@ test("a persistent upstream error after the decision drops the stream; AGY's ret
   let asked = 0;
   const proxy = await startAgyProxy({
     upstream: `http://127.0.0.1:${server.address().port}`,
-    route: async () => ({ choice: "gemini-3.1-pro-low", confidence: 0.9, asked: ++asked }),
+    route: async () => ({ choice: "gemini-4-argon-low", confidence: 0.9, asked: ++asked }),
     retryDelays: [],
   });
   t.after(proxy.close);
@@ -258,7 +274,7 @@ test("a persistent upstream error after the decision drops the stream; AGY's ret
   assert.equal(retry.status, 429);
   assert.match(retry.text, /RESOURCE_EXHAUSTED/);
   assert.doesNotMatch(retry.text, /\[Jev\]/);
-  assert.deepEqual(seen, ["gemini-3.1-pro-low", "gemini-3.1-pro-low"]);
+  assert.deepEqual(seen, ["gemini-4-argon-low", "gemini-4-argon-low"]);
   assert.equal(asked, 1, "the retry does not ask Jev again");
   assert.equal(generate, 2);
 });
@@ -284,7 +300,7 @@ test("retries a transient upstream failure without ending the stream AGY already
   t.after(() => server.close());
   const proxy = await startAgyProxy({
     upstream: `http://127.0.0.1:${server.address().port}`,
-    route: async () => ({ choice: "gemini-3.1-pro-low", confidence: 0.9 }),
+    route: async () => ({ choice: "gemini-4-argon-low", confidence: 0.9 }),
     retryDelays: [10],
   });
   t.after(proxy.close);
@@ -414,14 +430,14 @@ test("an image turn is described for Jev and attached for the model", async (t) 
     statusId,
     route: async ({ prompt }) => {
       asked.push(prompt);
-      return { choice: "gemini-3.1-pro-low", confidence: 0.9, request: { state: { request: prompt } } };
+      return { choice: "gemini-4-argon-low", confidence: 0.9, request: { state: { request: prompt } } };
     },
   });
   t.after(proxy.close);
   await post(proxy.port, "/v1internal:fetchAvailableModels", {});
 
   const res = await post(proxy.port, "/v1internal:streamGenerateContent?alt=sse", turn(`${shot} the layout is broken`));
-  assert.match(res.text, /\[Jev\] routed this turn to gemini-3.1-pro-low/);
+  assert.match(res.text, /\[Jev\] routed this turn to gemini-4-argon-low/);
 
   const described = describeCalls(upstream.seen);
   assert.equal(described.length, 1, "one description call per new turn");
@@ -434,7 +450,7 @@ test("an image turn is described for Jev and attached for the model", async (t) 
   assert.deepEqual(asked, ["[image: Red dialog reading BUILD FAILED: missing semicolon] the layout is broken"]);
 
   const sent = upstream.seen.at(-1);
-  assert.equal(sent.body.model, "gemini-3.1-pro-low");
+  assert.equal(sent.body.model, "gemini-4-argon-low");
   const parts = sent.body.request.contents.at(-1).parts;
   assert.equal(parts.filter((p) => p.inlineData).length, 1);
   assert.equal(parts[1].inlineData.mimeType, "image/png");
@@ -459,7 +475,7 @@ test("an image turn with 200+ chars of text routes without describing; the path 
     upstream: upstream.url,
     route: async ({ prompt }) => {
       asked.push(prompt);
-      return { choice: "gemini-3.1-pro-low", confidence: 0.9 };
+      return { choice: "gemini-4-argon-low", confidence: 0.9 };
     },
   });
   t.after(proxy.close);
@@ -499,7 +515,7 @@ test("a slow description falls back to the file name and the turn is still route
     describeDeadlineMs: 100,
     route: async ({ prompt }) => {
       asked.push(prompt);
-      return { choice: "gemini-3.1-pro-low", confidence: 0.9 };
+      return { choice: "gemini-4-argon-low", confidence: 0.9 };
     },
   });
   t.after(proxy.close);
@@ -508,14 +524,14 @@ test("a slow description falls back to the file name and the turn is still route
   const res = await post(proxy.port, "/v1internal:streamGenerateContent?alt=sse", turn(`${shot} why?`));
   assert.ok(Date.now() - started < 900, "the deadline bounds the wait");
   assert.equal(res.status, 200);
-  assert.match(res.text, /routed this turn to gemini-3.1-pro-low/);
+  assert.match(res.text, /routed this turn to gemini-4-argon-low/);
   assert.deepEqual(asked, ["[image attached: shot.png, not described] why?"]);
   assert.equal(upstream.seen.at(-1).body.request.contents.at(-1).parts[1].inlineData.mimeType, "image/png");
 });
 
 test("text-only turns make no extra upstream calls", async (t) => {
   const upstream = await fakeUpstream(t);
-  const proxy = await startAgyProxy({ upstream: upstream.url, route: async () => ({ choice: "gemini-3.1-pro-low", confidence: 0.9 }) });
+  const proxy = await startAgyProxy({ upstream: upstream.url, route: async () => ({ choice: "gemini-4-argon-low", confidence: 0.9 }) });
   t.after(proxy.close);
   await post(proxy.port, "/v1internal:fetchAvailableModels", {});
   await post(proxy.port, "/v1internal:streamGenerateContent?alt=sse", turn("refactor the auth module"));
@@ -534,7 +550,7 @@ test("a continuation re-attaches the same bytes with zero describe calls", async
   const { shot } = imageDir(t);
   const upstream = await fakeUpstream(t);
   const asked = [];
-  const proxy = await startAgyProxy({ upstream: upstream.url, route: async ({ prompt }) => (asked.push(prompt), { choice: "gemini-3.1-pro-low", confidence: 0.9 }) });
+  const proxy = await startAgyProxy({ upstream: upstream.url, route: async ({ prompt }) => (asked.push(prompt), { choice: "gemini-4-argon-low", confidence: 0.9 }) });
   t.after(proxy.close);
   await post(proxy.port, "/v1internal:fetchAvailableModels", {});
   await post(proxy.port, "/v1internal:streamGenerateContent?alt=sse", turn(`${shot} why is the layout broken?`));
@@ -542,7 +558,7 @@ test("a continuation re-attaches the same bytes with zero describe calls", async
 
   await post(proxy.port, "/v1internal:streamGenerateContent?alt=sse", { ...turn("x"), request: { ...turn("x").request, contents: imageHistory(shot) } });
   const sent = upstream.seen.at(-1).body.request.contents;
-  assert.equal(upstream.seen.at(-1).body.model, "gemini-3.1-pro-low", "continuation keeps the turn's model");
+  assert.equal(upstream.seen.at(-1).body.model, "gemini-4-argon-low", "continuation keeps the turn's model");
   assert.deepEqual(sent[0].parts[1].inlineData, firstImage, "same bytes as the first request");
   assert.equal(JSON.stringify(sent.slice(1)).includes("inlineData"), false, "only the message that named the image");
   assert.equal(describeCalls(upstream.seen).length, 1, "described once, on the new turn");
@@ -553,7 +569,7 @@ test("a follow-up turn keeps the earlier image and describes only the new prompt
   const { shot } = imageDir(t);
   const upstream = await fakeUpstream(t);
   const asked = [];
-  const proxy = await startAgyProxy({ upstream: upstream.url, route: async ({ prompt }) => (asked.push(prompt), { choice: "gemini-3.1-pro-low", confidence: 0.9 }) });
+  const proxy = await startAgyProxy({ upstream: upstream.url, route: async ({ prompt }) => (asked.push(prompt), { choice: "gemini-4-argon-low", confidence: 0.9 }) });
   t.after(proxy.close);
   await post(proxy.port, "/v1internal:fetchAvailableModels", {});
   await post(proxy.port, "/v1internal:streamGenerateContent?alt=sse", turn(`${shot} why is the layout broken?`));
@@ -596,7 +612,7 @@ test("a 4xx on a request with attached images is resent once without them", asyn
   const asked = [];
   const proxy = await startAgyProxy({
     upstream: `http://127.0.0.1:${server.address().port}`,
-    route: async ({ prompt }) => (asked.push(prompt), { choice: "gemini-3.1-pro-low", confidence: 0.9 }),
+    route: async ({ prompt }) => (asked.push(prompt), { choice: "gemini-4-argon-low", confidence: 0.9 }),
     retryDelays: [],
   });
   t.after(proxy.close);
@@ -609,7 +625,7 @@ test("a 4xx on a request with attached images is resent once without them", asyn
   assert.deepEqual(seen, [true, false]);
   assert.equal(asked[0], "[image attached: shot.png, not described] hi", "description failure is fail-open");
 
-  const manual = await post(proxy.port, "/v1internal:streamGenerateContent?alt=sse", { ...turn(`${shot} again`), model: "gemini-3.1-pro-low" });
+  const manual = await post(proxy.port, "/v1internal:streamGenerateContent?alt=sse", { ...turn(`${shot} again`), model: "gemini-4-argon-low" });
   assert.equal(manual.status, 200);
   assert.match(manual.text, /ok without image/);
   assert.deepEqual(seen, [true, false, true, false]);
@@ -629,7 +645,7 @@ test("a 4xx without proxy-attached images is passed through untouched", async (t
   t.after(() => server.close());
   const proxy = await startAgyProxy({ upstream: `http://127.0.0.1:${server.address().port}`, route: async () => null });
   t.after(proxy.close);
-  const res = await post(proxy.port, "/v1internal:streamGenerateContent?alt=sse", { ...turn("hi"), model: "gemini-3.1-pro-low" });
+  const res = await post(proxy.port, "/v1internal:streamGenerateContent?alt=sse", { ...turn("hi"), model: "gemini-4-argon-low" });
   assert.equal(res.status, 400);
   assert.equal(generate, 1);
 });
@@ -697,7 +713,7 @@ const continuationOf = (shot, trajectory = "traj-1") => {
 test("a 429 keeps the images through the normal retry, and the next continuation re-attaches", async (t) => {
   const { shot } = imageDir(t);
   const upstream = await scriptedUpstream(t, (n) => (n === 1 ? 429 : 200));
-  const proxy = await startAgyProxy({ upstream: upstream.url, route: routeTo("gemini-3.1-pro-low"), retryDelays: [10] });
+  const proxy = await startAgyProxy({ upstream: upstream.url, route: routeTo("gemini-4-argon-low"), retryDelays: [10] });
   t.after(proxy.close);
   await post(proxy.port, "/v1internal:fetchAvailableModels", {});
   const res = await post(proxy.port, "/v1internal:streamGenerateContent?alt=sse", turn(`${shot} why is the layout broken?`));
@@ -710,10 +726,10 @@ test("a 429 keeps the images through the normal retry, and the next continuation
 test("a 401 with attached images is sent exactly once and passed through", async (t) => {
   const { shot } = imageDir(t);
   const upstream = await scriptedUpstream(t, () => 401);
-  const proxy = await startAgyProxy({ upstream: upstream.url, route: routeTo("gemini-3.1-pro-low") });
+  const proxy = await startAgyProxy({ upstream: upstream.url, route: routeTo("gemini-4-argon-low") });
   t.after(proxy.close);
   await post(proxy.port, "/v1internal:fetchAvailableModels", {});
-  const res = await post(proxy.port, "/v1internal:streamGenerateContent?alt=sse", { ...turn(`${shot} hi`), model: "gemini-3.1-pro-low" });
+  const res = await post(proxy.port, "/v1internal:streamGenerateContent?alt=sse", { ...turn(`${shot} hi`), model: "gemini-4-argon-low" });
   assert.equal(res.status, 401);
   assert.deepEqual(upstream.seen, [[0]]);
 });
@@ -723,7 +739,7 @@ test("a 413 with images from several turns retries with the newest turn's images
   const second = join(dir, "second.png");
   writeFileSync(second, PNG);
   const upstream = await scriptedUpstream(t, (n, withImages) => (withImages.length > 1 ? 413 : 200));
-  const proxy = await startAgyProxy({ upstream: upstream.url, route: routeTo("gemini-3.1-pro-low") });
+  const proxy = await startAgyProxy({ upstream: upstream.url, route: routeTo("gemini-4-argon-low") });
   t.after(proxy.close);
   await post(proxy.port, "/v1internal:fetchAvailableModels", {});
   await post(proxy.port, "/v1internal:streamGenerateContent?alt=sse", turn(`${shot} why is the layout broken?`));
@@ -743,7 +759,7 @@ test("the image cache has a proxy-wide budget and evicts the least recently used
   const { shot } = imageDir(t);
   const upstream = await scriptedUpstream(t, () => 200);
   const one = PNG.toString("base64").length;
-  const proxy = await startAgyProxy({ upstream: upstream.url, route: routeTo("gemini-3.1-pro-low"), imageBudgetBytes: one + 1 });
+  const proxy = await startAgyProxy({ upstream: upstream.url, route: routeTo("gemini-4-argon-low"), imageBudgetBytes: one + 1 });
   t.after(proxy.close);
   await post(proxy.port, "/v1internal:fetchAvailableModels", {});
   const inConversation = (body, trajectory) => ((body.request.labels.trajectory_id = trajectory), body);
@@ -753,4 +769,20 @@ test("the image cache has a proxy-wide budget and evicts the least recently used
   assert.deepEqual(upstream.seen.at(-1), [0], "the newer conversation keeps its image");
   await post(proxy.port, "/v1internal:streamGenerateContent?alt=sse", continuationOf(shot, "old"));
   assert.deepEqual(upstream.seen.at(-1), [], "the older conversation was evicted");
+});
+
+test("the AGY decision line says when a checkpoint failed", () => {
+  const routing = { model: "gemini-4-argon-low", reason: "jev", confidence: 0.5 };
+  assert.equal(agyDecisionText(routing), "[Jev] routed this turn to gemini-4-argon-low (jev, confidence 0.50).\n\n");
+  assert.equal(agyDecisionText({ ...routing, checkpoint: { ok: true, commit: "abc" } }), agyDecisionText(routing));
+  assert.equal(
+    agyDecisionText({ ...routing, checkpoint: { ok: false, error: "git add failed" } }),
+    "[Jev] routed this turn to gemini-4-argon-low (jev, confidence 0.50). Checkpoint FAILED, no recovery point for this turn: git add failed\n\n",
+  );
+});
+
+test("the AGY decision line strips control characters from a checkpoint error", () => {
+  const text = agyDecisionText({ model: "m", reason: "jev", confidence: 0.5, checkpoint: { ok: false, error: "a\x1b]0;X\x07b" } });
+  assert.ok(text.endsWith("\n\n"));
+  assert.doesNotMatch(text.slice(0, -2), /[\x00-\x1f\x7f-\x9f]/);
 });

@@ -1,9 +1,9 @@
 import { spawn } from "node:child_process";
 import { accessSync, constants } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { AGY_AUTO_MODEL, AGY_DEFAULT_UPSTREAM, startAgyProxy } from "./agy-proxy.mjs";
 import { loadEnv } from "./codex-cli.mjs";
+import { checkKey } from "./credentials.mjs";
 import { executionWorkspace } from './execution-workspace.mjs';
 import { childEnv } from "./child-env.mjs";
 
@@ -62,11 +62,8 @@ export async function runAnti(args = process.argv.slice(2)) {
 
   loadEnv();
   if (!process.env.JEV_API_KEY && !process.env.TYPESAFE_API_KEY) {
-    process.stderr.write(
-      "[jev] no JEV_API_KEY found - starting AGY without routing\n" +
-        `[jev] add JEV_API_KEY=... to ${join(homedir(), ".jev-router.env")} and restart jev-agy\n`,
-    );
-    return execute(command, args);
+    const code = checkKey("jev-agy");
+    return code ?? execute(command, args);
   }
 
   // AGY reads CLOUD_CODE_URL as its API server. A value the user already set becomes the

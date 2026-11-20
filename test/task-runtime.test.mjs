@@ -233,7 +233,7 @@ test('runtime creates a real checkpoint with an unchanged branch and user index'
 for (const cli of ['claude', 'codex', 'antigravity', 'glm']) test(`${cli} adapter never forwards a held request`, async t => {
   let generation = 0;
   const catalog = cli === 'codex' ? { models: [{ slug: 'gpt-6-sol', supported_in_api: true, supported_reasoning_levels: [{ effort: 'high' }] }] }
-    : { models: { 'gemini-pro-agent': { displayName: 'Pro' } }, defaultAgentModelId: 'gemini-pro-agent' };
+    : { models: { 'gemini-4-argon-medium': { displayName: 'Gemini 4 Argon' } }, defaultAgentModelId: 'gemini-4-argon-medium' };
   const upstream = http.createServer((req, res) => {
     req.resume(); req.on('end', () => {
       if (/models|fetchAvailableModels/.test(req.url)) return res.end(JSON.stringify(catalog));
@@ -285,4 +285,41 @@ for (const cli of ['claude', 'codex', 'antigravity']) test(`${cli} manual model 
   const res = await fetch(`http://127.0.0.1:${proxy.port}${path}`, { method: 'POST', body: JSON.stringify(body), headers: { 'content-type': 'application/json' } });
   assert.equal(res.status, 409);
   assert.equal(generation, 0);
+});
+
+test('checkpoint failure: hold by default, opt-in warn continues locally and the note says so', async t => {
+  const fail = async () => { throw Object.assign(new Error('git add failed: fatal: unable to stat'), { code: 'add_failed' }); };
+  const { runtime: held } = fixture(t, { config: { checkpoint: true }, checkpoint: fail });
+  await assert.rejects(held.route({ prompt: original, models }),
+    err => err.routingHold && /Checkpoint required/.test(err.message) && /onFailure/.test(err.message));
+  const { runtime: warned } = fixture(t, { config: { checkpoint: true, checkpointOptions: { onFailure: 'warn' } }, checkpoint: fail });
+  const result = await warned.route({ prompt: original, models });
+  assert.equal(result.checkpoint.ok, false);
+  assert.equal(result.checkpoint.code, 'add_failed');
+  const { routingNotice } = await import('../src/proxy.mjs');
+  const note = routingNotice({ model: 'cheap', effort: 'low', confidence: 0.8, reason: 'jev', checkpoint: result.checkpoint });
+  assert.match(note, /^\[Jev\] routed this turn to cheap .*Checkpoint FAILED, no recovery point for this turn: git add failed/);
+  assert.ok(!note.includes('\n'), 'one line, so history stripping removes it with the note');
+  assert.doesNotMatch(routingNotice({ model: 'cheap', reason: 'jev', checkpoint: { ok: true } }), /Checkpoint/);
+  const { jevDecisionEvents } = await import('../src/codex-proxy.mjs');
+  assert.match(jevDecisionEvents({ model: 'm', reason: 'jev', checkpoint: result.checkpoint }), /Checkpoint FAILED/);
+});
+
+test('warn mode never lets a handoff proceed without a checkpoint', async t => {
+  const { runtime } = fixture(t, { policy: { ...policy, rules: [{ ...rule, cli: 'codex' }] },
+    config: { checkpoint: true, handoff: true, checkpointOptions: { onFailure: 'warn' }, externalModels: [{ cli: 'codex', id: 'strong-v1', efforts: ['high'] }] },
+    checkpoint: async () => { throw new Error('locked'); },
+    handoff: async () => { throw new Error('handoff must not run'); } });
+  await assert.rejects(runtime.route({ prompt: original, models }), err => err.routingHold && /Checkpoint required/.test(err.message));
+});
+
+test('a failed checkpoint is reported only on the turn that tried to take it', async t => {
+  let attempts = 0;
+  const fail = async () => { attempts++; throw new Error('git add failed: fatal: unable to stat'); };
+  const { runtime } = fixture(t, { config: { checkpoint: true, checkpointOptions: { onFailure: 'warn' } }, checkpoint: fail });
+  const first = await runtime.route({ prompt: original, models });
+  assert.equal(first.checkpoint.ok, false);
+  const second = await runtime.route({ prompt: 'Review the code and grade it.', models });
+  assert.equal(attempts, 1, 'the read-only turn takes no checkpoint');
+  assert.equal(second.checkpoint, null);
 });

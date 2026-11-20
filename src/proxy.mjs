@@ -15,7 +15,7 @@ import {
 } from "./config.mjs";
 import { askJev, warmJev } from "./router.mjs";
 import { decide } from "./policy.mjs";
-import { createTaskRuntime, sendRoutingHold } from "./task-runtime.mjs";
+import { checkpointWarning, createTaskRuntime, sendRoutingHold } from "./task-runtime.mjs";
 import { createCapabilityRuntime } from "./capability-runtime.mjs";
 import { log, writeDump } from "./log.mjs";
 import { writeDecision, writeStatus } from "./status.mjs";
@@ -42,11 +42,47 @@ export function claudeEffort(tier, recommended, previous) {
     : CLAUDE_MANUAL_EFFORTS.includes(previous) ? previous : null;
 }
 
-export function routingNotice({ model, effort, confidence, reason, capabilities = "" }) {
+export function routingNotice({ model, effort, confidence, reason, capabilities = "", checkpoint = null }) {
   const detail = confidence == null ? reason : `${reason}, confidence ${confidence.toFixed(2)}`;
   const effortDetail = effort ? `effort auto → ${effort}`
     : tierSpec(tierOf(model))?.effort === false ? "effort n/a" : "effort unset";
-  return `[Jev] routed this turn to ${model} (${detail}, ${effortDetail}).${capabilities ? ` ${capabilities}.` : ""}`;
+  // Same line as the note, so history stripping removes it with the note.
+  return `[Jev] routed this turn to ${model} (${detail}, ${effortDetail}).${capabilities ? ` ${capabilities}.` : ""}${checkpointWarning(checkpoint)}`;
+}
+
+// A note, real or imitated, is one whole line; the capabilities sentence shares that line.
+const LEADING_NOTES = /^(?:[ \t]*\[Jev\] (?:routed this turn to |unavailable;)[^\n]*(?:\n|$)(?:[ \t]*\n)*)+/;
+
+/**
+ * Removes Jev's notes from the start of assistant text in history. Returns the same body.
+ *
+ * Claude Code stores the note as part of the reply and sends it back on every request.
+ * A model that sees its past turns open with `[Jev] ...` lines starts writing them itself,
+ * so the stack grows each turn. Only leading note lines go; tool, thinking and user
+ * content are untouched. A block or message left empty is dropped.
+ */
+export function stripClaudeNotes(body) {
+  if (!Array.isArray(body?.messages)) return body;
+  body.messages = body.messages.flatMap((message) => {
+    if (message?.role !== "assistant") return [message];
+    if (typeof message.content === "string") {
+      if (!message.content.includes("[Jev] ")) return [message];
+      const content = message.content.replace(LEADING_NOTES, "");
+      return content ? [{ ...message, content }] : [];
+    }
+    if (!Array.isArray(message.content)) return [message];
+    let changed = false;
+    const content = message.content.flatMap((block) => {
+      if (block?.type !== "text" || typeof block.text !== "string" || !block.text.includes("[Jev] ")) return [block];
+      const text = block.text.replace(LEADING_NOTES, "");
+      if (text === block.text) return [block];
+      changed = true;
+      return text ? [{ ...block, text }] : [];
+    });
+    if (!changed) return [message];
+    return content.length ? [{ ...message, content }] : [];
+  });
+  return body;
 }
 
 /** Prefix the first real text delta so Claude Code's UI renders the decision. */
@@ -319,6 +355,7 @@ export async function startProxy({
             writeDump(JSON.stringify(body, null, 2));
           }
           body.tools?.forEach((t) => sanitizeSchema(t.input_schema));
+          stripClaudeNotes(body);
           if (Array.isArray(body.tools)) tasks.assertLocal(conversationKey(body));
 
           // Anything that is not the sentinel is a model the user chose, and an explicit
@@ -423,7 +460,7 @@ export async function startProxy({
               body.output_config.effort = state.effort;
             }
             tasks.assertModel({ taskKey: key, model, effort: state.effort });
-            if (fresh) state.notice = routingNotice({ model, effort: state.effort, confidence: fresh.confidence, reason: fresh.reason, capabilities: state.capabilityNotice });
+            if (fresh) state.notice = routingNotice({ model, effort: state.effort, confidence: fresh.confidence, reason: fresh.reason, capabilities: state.capabilityNotice, checkpoint: fresh.checkpoint });
             notice = state.notice;
             // Publish what went out. Claude Code's UI shows the row you picked, not the tier
             // it resolved to, so the status line is the only place this is visible.

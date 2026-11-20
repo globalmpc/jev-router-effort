@@ -10,8 +10,8 @@ import { readSavedModel, restoreSavedModel } from "../src/settings.mjs";
 import { LOG_FILE } from "../src/log.mjs";
 import { childEnv } from "../src/child-env.mjs";
 import { writeStatusFile } from "../src/status.mjs";
-import { userEnvFiles } from "../src/codex-cli.mjs";
 import { executionWorkspace } from '../src/execution-workspace.mjs';
+import { checkKey, loadJevKey } from "../src/credentials.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = dirname(HERE);
@@ -72,15 +72,10 @@ function statusLineArgs() {
   }
 }
 
-// Existing environment variables win, followed by the shared user-level file, then the
-// legacy Claude-specific file. A project-local .env is never read.
-for (const file of userEnvFiles()) {
-  try {
-    process.loadEnvFile(file);
-  } catch {
-    // Missing or unreadable; the key may still come from the real environment.
-  }
-}
+// Existing environment variables win, then ~/.jev-router.env, ~/.jev-claude.env, and finally
+// the macOS Keychain, so a launcher exec'd without the shell function still routes. A
+// project-local .env is never read.
+loadJevKey();
 
 /**
  * Finds the Claude Code executable on PATH. Resolving it here rather than leaning on the
@@ -124,6 +119,8 @@ if (!claude) {
 if (process.env.JEV_API_KEY || process.env.TYPESAFE_API_KEY) {
   const { port, close } = await startProxy(workspace);
   env.ANTHROPIC_BASE_URL = `http://127.0.0.1:${port}`;
+  // A parent session without a key must not mark this routed child as off.
+  delete env.JEV_ROUTER_OFF;
   env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY = "1";
   Object.assign(env, autoModelEnv());
   process.on("exit", () => {
@@ -135,10 +132,11 @@ if (process.env.JEV_API_KEY || process.env.TYPESAFE_API_KEY) {
     process.stderr.write(`[jev] routing decisions -> ${LOG_FILE}\n`);
   }
 } else {
-  process.stderr.write(
-    `[jev] no JEV_API_KEY found - starting Claude Code without routing\n` +
-      `[jev] set it in ${join(homedir(), ".jev-router.env")} to enable routing\n`,
-  );
+  const code = checkKey("jev-claude");
+  if (code != null) process.exit(code);
+  // The stderr warning is covered by the TUI at once, so the status line keeps saying it.
+  env.JEV_ROUTER_OFF = "no key";
+  args.push(...statusLineArgs());
 }
 
 // On Windows a `.cmd` shim still needs a shell; a real executable does not.

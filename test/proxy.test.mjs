@@ -12,6 +12,7 @@ import {
   claudeEffort,
   routingNotice,
   prependRoutingNotice,
+  stripClaudeNotes,
 } from "../src/proxy.mjs";
 
 test("only the sentinel model is routed", () => {
@@ -254,6 +255,84 @@ test("Claude proxy shows the routing decision before the model's first streamed 
   assert.match(deltas[0].delta.text, /^\[Jev\] routed this turn to claude-sonnet-5/);
   assert.match(deltas[0].delta.text, /\nDone\.$/);
   assert.equal(deltas[0].index, 0);
+});
+
+test("history loses stacked Jev notes but keeps real content, tool blocks and user text", () => {
+  const notice = routingNotice({ model: "claude-opus-5-5", effort: "high", confidence: 0.83, reason: "jev", capabilities: "skill docs (recommended)" });
+  const fake = "[Jev] routed this turn to claude-opus-5-5 (jev, confidence 0.41, effort auto → high).";
+  const thinking = { type: "thinking", thinking: "plan", signature: "sig" };
+  const tool = { type: "tool_use", id: "toolu_1", name: "Bash", input: { command: "ls" } };
+  const body = {
+    messages: [
+      { role: "user", content: "[Jev] routed this turn to x (quoted by the user)." },
+      { role: "assistant", content: [thinking, { type: "text", text: `${notice}\n${fake}\n${fake}\n\n    indented answer\n[Jev] routed this turn to mid-text stays.` }, tool] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "ok" }] },
+      { role: "assistant", content: [{ type: "text", text: `${notice}\n` }, tool] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "ok" }] },
+      { role: "assistant", content: `[Jev] unavailable; using claude-opus-5-5.\nPlain string reply.` },
+      { role: "assistant", content: [{ type: "text", text: notice }] },
+      { role: "assistant", content: [{ type: "text", text: "No note here." }] },
+      { role: "user", content: "next" },
+    ],
+  };
+  const untouched = body.messages[7];
+  stripClaudeNotes(body);
+  assert.equal(body.messages.length, 8, "a message left empty is dropped");
+  assert.equal(body.messages[0].content, "[Jev] routed this turn to x (quoted by the user).");
+  assert.deepEqual(body.messages[1].content, [thinking, { type: "text", text: "    indented answer\n[Jev] routed this turn to mid-text stays." }, tool]);
+  assert.deepEqual(body.messages[3].content, [tool], "a text block left empty is dropped; tool_use untouched");
+  assert.equal(body.messages[5].content, "Plain string reply.");
+  assert.equal(body.messages[6], untouched);
+  assert.equal(JSON.stringify(body).includes("confidence 0.41"), false);
+});
+
+test("Claude proxy forwards cleaned history and still streams exactly one note per new turn", async (t) => {
+  const frame = (type, data) => `event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`;
+  const received = [];
+  const upstream = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    received.push(JSON.parse(Buffer.concat(chunks).toString()));
+    res.setHeader("content-type", "text/event-stream");
+    res.write(frame("message_start", { message: { id: "msg_1", model: "claude-sonnet-5-5" } }));
+    res.write(frame("content_block_start", { index: 0, content_block: { type: "text", text: "" } }));
+    res.write(frame("content_block_delta", { index: 0, delta: { type: "text_delta", text: "Done." } }));
+    res.write(frame("content_block_delta", { index: 0, delta: { type: "text_delta", text: " More." } }));
+    res.write(frame("content_block_stop", { index: 0 }));
+    res.end(frame("message_stop", {}));
+  });
+  await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  t.after(() => upstream.close());
+  const { port, close } = await startProxy({
+    upstreamURL: `http://127.0.0.1:${upstream.address().port}`,
+    route: async () => ({ choice: "claude-sonnet-5-5", effort: "low", confidence: 0.91 }),
+  });
+  t.after(close);
+  const fake = "[Jev] routed this turn to claude-sonnet-5-5 (jev, confidence 0.12, effort auto → low).";
+  const send = (messages) => fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "jev-router", stream: true, tools: [{ name: "Bash" }], messages }),
+  }).then((response) => response.text());
+  const notes = (data) => [...data.matchAll(/^data: (\{.*\})$/gm)].map(([, json]) => JSON.parse(json))
+    .filter((event) => event.type === "content_block_delta")
+    .reduce((sum, event) => sum + (event.delta.text.match(/\[Jev\] /g)?.length ?? 0), 0);
+  const tool = { type: "tool_use", id: "toolu_9", name: "Bash", input: { command: "pwd" } };
+
+  const first = await send([
+    { role: "user", content: `first ${process.pid}` },
+    { role: "assistant", content: [{ type: "text", text: `${fake}\n${fake}\n${fake}\nEarlier answer.` }] },
+    { role: "user", content: `second ${process.pid}` },
+  ]);
+  assert.equal(notes(first), 1, "a new turn shows one note");
+  assert.deepEqual(received[0].messages[1].content, [{ type: "text", text: "Earlier answer." }]);
+
+  const continuation = await send([
+    { role: "user", content: `second ${process.pid}` },
+    { role: "assistant", content: [{ type: "text", text: `${fake}\nLooking.` }, tool] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_9", content: "/tmp" }] },
+  ]);
+  assert.equal(notes(continuation), 0, "a tool_result continuation shows no note");
+  assert.deepEqual(received[1].messages[1].content, [{ type: "text", text: "Looking." }, tool]);
 });
 
 test("a routed request without metadata is recorded under the conversation key", async (t) => {
