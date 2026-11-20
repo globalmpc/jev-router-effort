@@ -1,11 +1,13 @@
 import http from "node:http";
 import https from "node:https";
 import { createHash, randomUUID } from "node:crypto";
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { availableTiers, shouldUseExactModel } from "./config.mjs";
 import { askJev, warmJev } from "./router.mjs";
 import { decide } from "./policy.mjs";
-import { createTaskRuntime, sendRoutingHold } from "./task-runtime.mjs";
+import { checkpointWarning, createTaskRuntime, sendRoutingHold } from "./task-runtime.mjs";
 import { createCapabilityRuntime } from "./capability-runtime.mjs";
 import { log, writeDump } from "./log.mjs";
 import { writeDecision, writeStatus } from "./status.mjs";
@@ -23,6 +25,9 @@ import { rejectForeign } from "./local-guard.mjs";
 const CHATGPT_BASE_URL = "https://chatgpt.com/backend-api/codex";
 const API_BASE_URL = "https://api.openai.com/v1";
 export const CODEX_AUTO_MODEL = "jev-router";
+export const CODEX_ULTRAFAST_MODEL = "jev-router-ultrafast";
+const ULTRAFAST = "ultrafast";
+export const isCodexRouterModel = (model) => model === CODEX_AUTO_MODEL || model === CODEX_ULTRAFAST_MODEL;
 export const CODEX_AUTO_EFFORT = "auto";
 // The native picker also lists client modes such as Ultra (automatic delegation).
 // Those modes are not valid Responses API reasoning.effort values.
@@ -30,6 +35,8 @@ const API_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"
 const apiEffortsOf = (model) =>
   model?.supported_reasoning_levels?.map((level) => level.effort)
     .filter((effort) => API_EFFORTS.has(effort)) ?? [];
+const serviceTierIdsOf = (model) =>
+  new Set((model?.service_tiers ?? []).map((tier) => tier?.id).filter(Boolean));
 const DEFAULT_MODELS = {
   haiku: "gpt-5.6-luna",
   sonnet: "gpt-5.6-terra",
@@ -42,6 +49,65 @@ const MODEL_ENV = {
   opus: "JEV_CODEX_STRONG_MODEL",
   fable: "JEV_CODEX_LONG_MODEL",
 };
+
+const MAX_REMEMBERED_TOKENS = 256;
+// Bound to the account, so a token remembered for one account never unlocks another.
+const tokenDigest = (accountId, token) => createHash("sha256").update(`${accountId}\n${token}`).digest("hex");
+
+/** The ChatGPT login saved in auth.json, or null when the file holds none. Never an API key. */
+function savedChatGptLogin(authFile = join(process.env.CODEX_HOME ?? join(homedir(), ".codex"), "auth.json")) {
+  try {
+    const auth = JSON.parse(readFileSync(authFile, "utf8"));
+    if (
+      auth.auth_mode !== "chatgpt" ||
+      typeof auth.tokens?.account_id !== "string" ||
+      typeof auth.tokens?.access_token !== "string" ||
+      !auth.tokens.access_token
+    ) return null;
+    return { accountId: auth.tokens.account_id, token: auth.tokens.access_token };
+  } catch {
+    return null;
+  }
+}
+
+/** Records a token digest (never the token), most recently used last, keeping only the most recent ones. */
+function rememberToken(seen, digest) {
+  seen.delete(digest);
+  seen.add(digest);
+  while (seen.size > MAX_REMEMBERED_TOKENS) seen.delete(seen.values().next().value);
+}
+
+/** Notes the token currently saved in auth.json, so a session still holding it is recognised later. */
+export function rememberCodexToken(seen, authFile) {
+  const login = savedChatGptLogin(authFile);
+  if (login) rememberToken(seen, tokenDigest(login.accountId, login.token));
+}
+
+/**
+ * Long-running Codex processes can keep sending the OAuth access token they
+ * started with after another Codex process refreshes auth.json. For ChatGPT
+ * accounts only, replace that stale bearer with the current token.
+ *
+ * The account id header proves nothing: any local process that reaches the
+ * proxy can send it. So the bearer is replaced only when the request already
+ * carries a token this proxy has seen in auth.json for the same account
+ * (`seen`, digests of account and token only), which a session started from
+ * that file has and another caller does not. A request without a bearer, or
+ * with an unknown one, is forwarded unchanged. A recognised bearer is marked
+ * as recently used, so a session in use never ages out of the history.
+ * Never use an API key from disk and never cross account boundaries.
+ */
+export function currentCodexHeaders(headers, authFile, seen = new Set()) {
+  if (!headers?.["chatgpt-account-id"]) return headers;
+  const login = savedChatGptLogin(authFile);
+  if (!login || login.accountId !== headers["chatgpt-account-id"]) return headers;
+  const sent = /^Bearer\s+(\S+)$/i.exec(headers.authorization ?? "")?.[1];
+  const sentDigest = sent && sent !== login.token ? tokenDigest(login.accountId, sent) : null;
+  const recognised = sentDigest !== null && seen.has(sentDigest);
+  if (recognised) rememberToken(seen, sentDigest);
+  rememberToken(seen, tokenDigest(login.accountId, login.token));
+  return recognised ? { ...headers, authorization: `Bearer ${login.token}` } : headers;
+}
 
 export const codexModelOf = (tier) => process.env[MODEL_ENV[tier]] ?? DEFAULT_MODELS[tier];
 
@@ -57,7 +123,7 @@ export function codexTierOf(model) {
 /** Only models reported by the account are eligible, including on cold start. */
 export function codexModels(models = new Map()) {
   const available = [...models.values()]
-    .filter((model) => model.slug !== CODEX_AUTO_MODEL && model.supported_in_api !== false)
+    .filter((model) => !isCodexRouterModel(model.slug) && model.supported_in_api !== false)
     .map((model) => {
       const efforts = apiEffortsOf(model);
       return {
@@ -215,14 +281,31 @@ export function addJevModel(catalog) {
   if (!template) return catalog;
   const effortLevels = [];
   const seenEfforts = new Set();
+  const serviceTiers = [];
+  const seenServiceTiers = new Set();
+  const additionalSpeedTiers = [];
+  const seenSpeedTiers = new Set();
   for (const model of catalog.models) {
     for (const level of model.supported_reasoning_levels ?? []) {
       if (!level?.effort || seenEfforts.has(level.effort)) continue;
       seenEfforts.add(level.effort);
       effortLevels.push(level);
     }
+    for (const tier of model.service_tiers ?? []) {
+      if (!tier?.id || seenServiceTiers.has(tier.id)) continue;
+      seenServiceTiers.add(tier.id);
+      serviceTiers.push(tier);
+    }
+    for (const tier of model.additional_speed_tiers ?? []) {
+      if (!tier || seenSpeedTiers.has(tier)) continue;
+      seenSpeedTiers.add(tier);
+      additionalSpeedTiers.push(tier);
+    }
   }
-  catalog.models.unshift({
+  const ultrafastTemplate = catalog.models.find((model) =>
+    model.supported_in_api !== false && availableTiers().includes(codexTierOf(model.slug)) &&
+    serviceTierIdsOf(model).has(ULTRAFAST));
+  const auto = {
     ...template,
     slug: CODEX_AUTO_MODEL,
     display_name: "Jev Router",
@@ -236,7 +319,26 @@ export function addJevModel(catalog) {
       { effort: CODEX_AUTO_EFFORT, description: "Jev chooses the reasoning effort for each turn." },
       ...effortLevels,
     ],
-  });
+    default_service_tier: null,
+    service_tiers: serviceTiers.filter((tier) => tier.id !== ULTRAFAST),
+    additional_speed_tiers: additionalSpeedTiers.filter((tier) => tier !== ULTRAFAST),
+  };
+  const rows = [auto];
+  if (ultrafastTemplate) {
+    rows.push({
+      ...ultrafastTemplate,
+      slug: CODEX_ULTRAFAST_MODEL,
+      display_name: "Jev Router Ultrafast",
+      description: "Jev routes among models that support Ultrafast.",
+      visibility: "list",
+      supported_in_api: true,
+      priority: 1,
+      upgrade: null,
+      default_reasoning_level: CODEX_AUTO_EFFORT,
+      supported_reasoning_levels: auto.supported_reasoning_levels,
+    });
+  }
+  catalog.models.unshift(...rows);
   return catalog;
 }
 
@@ -252,6 +354,12 @@ export function applyCodexTier(body, tier, models = new Map(), model = codexMode
     if (effort) body.reasoning.effort = effort;
     else delete body.reasoning.effort;
   }
+  if (
+    body.service_tier &&
+    body.service_tier !== "default" &&
+    info &&
+    !serviceTierIdsOf(info).has(body.service_tier)
+  ) delete body.service_tier;
   return body;
 }
 
@@ -271,7 +379,7 @@ export const upstreamFor = (
   apiBaseURL = API_BASE_URL,
 ) => /\/models(?:\?|$)/.test(path) || headers["chatgpt-account-id"] ? chatgptBaseURL : apiBaseURL;
 
-export function jevDecisionEvents({ tier, model = codexModelOf(tier), effort, effortMode, confidence, effortConfidence, reason, capabilities = "" }) {
+export function jevDecisionEvents({ tier, model = codexModelOf(tier), effort, effortMode, confidence, effortConfidence, reason, capabilities = "", checkpoint = null }) {
   const detail = confidence == null ? reason : `${reason}, confidence ${confidence.toFixed(2)}`;
   const effortDetail = effort
     ? effortMode === CODEX_AUTO_EFFORT
@@ -281,7 +389,7 @@ export function jevDecisionEvents({ tier, model = codexModelOf(tier), effort, ef
   const id = `jev-${randomUUID()}`;
   const text = reason.startsWith("jev-unavailable")
     ? `[Jev] unavailable; using ${model}. Add JEV_API_KEY=... to ~/.jev-router.env and restart jev-codex.`
-    : `[Jev] routed this turn to ${model} (${detail}${effortDetail}).${capabilities ? ` ${capabilities}.` : ""}`;
+    : `[Jev] routed this turn to ${model} (${detail}${effortDetail}).${capabilities ? ` ${capabilities}.` : ""}${checkpointWarning(checkpoint)}`;
   const item = {
     type: "message",
     role: "assistant",
@@ -310,6 +418,7 @@ export async function startCodexProxy({
   runtimeConfig,
   checkpoint,
   handoff,
+  codexAuthFile,
   cwd = process.cwd(),
   workspaceError,
 } = {}) {
@@ -318,6 +427,9 @@ export async function startCodexProxy({
   const states = new Map();
   const models = new Map();
   const capabilities = createCapabilityRuntime({ cli: "codex", config: tasks.config, cwd });
+  // The token Codex starts with, so a session that stays idle past a refresh is still recognised.
+  const seenCodexTokens = new Set();
+  rememberCodexToken(seenCodexTokens, codexAuthFile);
 
   const server = http.createServer((req, res) => {
     if (rejectForeign(req, res, server.address().port)) return;
@@ -327,6 +439,8 @@ export async function startCodexProxy({
       let out = Buffer.concat(chunks);
       let routing;
       let capability = null;
+      // One credential view per request, shared by the catalog lookup, image descriptions and forwarding.
+      const authHeaders = currentCodexHeaders(req.headers, codexAuthFile, seenCodexTokens);
       if (req.method === "POST" && /\/responses(?:\?|$)/.test(req.url ?? "")) {
         try {
           const body = JSON.parse(out.toString());
@@ -334,11 +448,14 @@ export async function startCodexProxy({
           if (process.env.JEV_DUMP) {
             writeDump(JSON.stringify(body, null, 2));
           }
-          if (body.model === CODEX_AUTO_MODEL) {
+          if (isCodexRouterModel(body.model)) {
+            const ultrafast = body.model === CODEX_ULTRAFAST_MODEL;
+            if (ultrafast) body.service_tier = ULTRAFAST;
+            else if (body.service_tier === ULTRAFAST) delete body.service_tier;
             // Codex may reuse its own catalog cache and never GET /models through us.
             // Fetch with this request's account credentials instead of inventing ids.
             if (!models.size) {
-              const headers = { ...req.headers };
+              const headers = { ...authHeaders };
               for (const name of ["host", "content-length", "connection", "content-type", "accept-encoding"]) delete headers[name];
               const clientVersion = req.headers["version"] ?? /codex[^/]*\/([\d.]+)/i.exec(req.headers["user-agent"] ?? "")?.[1] ?? "0.157.1";
               const response = await fetch(`${chatgptBaseURL}/models?client_version=${encodeURIComponent(clientVersion)}`, {
@@ -353,13 +470,16 @@ export async function startCodexProxy({
             tasks.assertLocal(key);
             const candidates = codexModels(models).filter((model) =>
               availableTiers().includes(model.tier) &&
+              (!ultrafast || serviceTierIdsOf(models.get(model.id)).has(ULTRAFAST)) &&
               // Keep the CLI's wire format: Lite bodies cannot safely be sent
               // to legacy models merely by removing the protocol header.
               (req.headers["x-openai-internal-codex-responses-lite"] === undefined ||
                 models.get(model.id)?.use_responses_lite === true),
             );
             const available = [...new Set(candidates.map((model) => model.tier))];
-            if (!candidates.length) throw new Error("No account models available for routing");
+            if (!candidates.length) throw new Error(ultrafast
+              ? "No compatible account models support Ultrafast; select Jev Router for standard speed"
+              : "No account models available for routing");
             const previousModel = states.get(key)?.model;
             const currentModel = candidates.some((model) => model.id === previousModel)
               ? previousModel : modelForTier(candidates, "opus");
@@ -377,7 +497,7 @@ export async function startCodexProxy({
               const images = codexTurnImages(body);
               const descriptions = images.length && shouldDescribeImages(prompt)
                 ? await describe({
-                    images, headers: req.headers, deadlineMs: describeDeadlineMs,
+                    images, headers: authHeaders, deadlineMs: describeDeadlineMs,
                     baseURL: upstreamFor(req.headers, req.url, chatgptBaseURL, apiBaseURL),
                     model: candidates.find((candidate) => candidate.tier === "haiku") ?? candidates[0],
                   })
@@ -441,14 +561,26 @@ export async function startCodexProxy({
               writeDecision(statusId, routing);
               debug(`${key} ${current} -> ${tier} (${decision.reason}) | ${prompt.slice(0, 60)}`);
             }
+            // "auto" is a Jev-only level; upstream rejects it. Resolve it even when
+            // this request skipped routing (no new-turn prompt, no saved state).
+            if (!effort && effortMode === CODEX_AUTO_EFFORT) {
+              effort = effortForModel(candidates.find((candidate) => candidate.id === model), null, null);
+            }
             if (effort) {
               body.reasoning ??= {};
               body.reasoning.effort = effort;
+            } else if (body.reasoning?.effort === CODEX_AUTO_EFFORT) {
+              delete body.reasoning.effort;
             }
             capabilities?.inject(body, key);
             applyCodexTier(body, tier, models, model);
             tasks.assertModel({ taskKey: key, model, effort });
           } else {
+            // jev-codex defaults model_reasoning_effort to "auto", and chat pickers keep
+            // that effort after switching to a concrete model. Upstream rejects it.
+            if (body.reasoning?.effort && !API_EFFORTS.has(body.reasoning.effort)) {
+              applyCodexTier(body, null, models, body.model);
+            }
             const prompt = codexNewTurnPrompt(body);
             const explaining = prompt?.includes("<jev-explain>") || /^\$jev-explain\b/i.test(prompt ?? "");
             if (prompt && !explaining) writeStatus(statusId, { manual: true, at: Date.now() });
@@ -463,10 +595,11 @@ export async function startCodexProxy({
         }
       }
 
-      const base = upstreamFor(req.headers, req.url, chatgptBaseURL, apiBaseURL);
+      const requestHeaders = authHeaders;
+      const base = upstreamFor(requestHeaders, req.url, chatgptBaseURL, apiBaseURL);
       const target = new URL(base);
       const transport = target.protocol === "http:" ? http : https;
-      const headers = { ...req.headers, host: target.host };
+      const headers = { ...requestHeaders, host: target.host };
       delete headers["content-length"];
       const upstream = transport.request(
         {

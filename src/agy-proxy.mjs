@@ -7,7 +7,7 @@ import { availableTiers, shouldUseExactModel } from "./config.mjs";
 import { askJev, warmJev } from "./router.mjs";
 import { shouldDescribeImages } from "./image-describe.mjs";
 import { decide } from "./policy.mjs";
-import { createTaskRuntime, sendRoutingHold } from "./task-runtime.mjs";
+import { checkpointWarning, createTaskRuntime, sendRoutingHold } from "./task-runtime.mjs";
 import { log, writeDump } from "./log.mjs";
 import { writeDecision, writeStatus } from "./status.mjs";
 import { rejectForeign } from "./local-guard.mjs";
@@ -20,11 +20,11 @@ export const AGY_AUTO_MODEL = "jev-router";
 // next request so the model never reads Jev's notes as its own output.
 const NOTE = /\[Jev\] (?:routed this turn to|unavailable;)[^\n]*\n\n/g;
 
-// Only Gemini is routed: Claude through AGY rejects replayed thinking parts without a signature.
+// Only the two approved Gemini families are routed. Manual native choices stay untouched.
 export function agyTierOf(id) {
   if (typeof id !== "string") return null;
-  if (/^gemini-[\w.-]*flash-(?:extra-low|low|medium|high)$/.test(id)) return "haiku";
-  if (/^gemini-[\w.-]*pro-(?:low|medium|high|agent)$/.test(id) || id === "gemini-pro-agent") return "opus";
+  if (/^gemini-3\.8-flash-(?:low|medium|high)$/.test(id)) return "haiku";
+  if (/^gemini-4-argon-(?:low|medium|high)$/.test(id)) return "opus";
   return null;
 }
 
@@ -370,10 +370,10 @@ export function applyAgyModel(body, id, info) {
   return body;
 }
 
-export function agyDecisionText({ model, reason, confidence }) {
+export function agyDecisionText({ model, reason, confidence, checkpoint = null }) {
   if (reason.startsWith("jev-unavailable")) return `[Jev] unavailable; using ${model}.\n\n`;
   const detail = confidence == null ? reason : `${reason}, confidence ${confidence.toFixed(2)}`;
-  return `[Jev] routed this turn to ${model} (${detail}).\n\n`;
+  return `[Jev] routed this turn to ${model} (${detail}).${checkpointWarning(checkpoint)}\n\n`;
 }
 
 const agyDecisionEvent = (text, delimiter = "\r\n\r\n") =>

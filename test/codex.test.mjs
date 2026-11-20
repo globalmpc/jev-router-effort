@@ -279,3 +279,50 @@ console.log(JSON.stringify([process.env.CLOUD_CODE_URL ?? null, process.env.ZAI_
   const out = execFileSync(process.execPath, ["--input-type=module", "-e", script], { cwd, env, encoding: "utf8" });
   assert.deepEqual(JSON.parse(out), [null, null, "yes"]);
 });
+
+test("proxy resolves the Jev-only auto effort for a manually selected model", async (t) => {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      seen.push({ url: req.url, body: chunks.length ? JSON.parse(Buffer.concat(chunks)) : null });
+      if (req.url.startsWith("/backend-api/codex/models")) {
+        res.setHeader("content-type", "application/json");
+        return res.end(JSON.stringify({
+          models: [{
+            slug: "gpt-5.6-sol",
+            visibility: "list",
+            supported_in_api: true,
+            default_reasoning_level: "medium",
+            supported_reasoning_levels: [{ effort: "low" }, { effort: "medium" }, { effort: "high" }],
+          }],
+        }));
+      }
+      res.end("{}");
+    });
+  });
+  await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  t.after(() => upstream.close());
+  const upstreamURL = `http://127.0.0.1:${upstream.address().port}`;
+  const { port, close } = await startCodexProxy({
+    chatgptBaseURL: `${upstreamURL}/backend-api/codex`,
+    apiBaseURL: `${upstreamURL}/v1`,
+    route: async () => null,
+  });
+  t.after(close);
+  const headers = { authorization: "Bearer token", "chatgpt-account-id": "acct", "content-type": "application/json" };
+  const send = (body) => fetch(`http://127.0.0.1:${port}/responses`, { method: "POST", headers, body: JSON.stringify(body) });
+
+  // Before the catalog is known, drop the effort so the model default applies.
+  await send({ model: "gpt-5.6-sol", reasoning: { effort: "auto" }, input: [] });
+  assert.equal(seen.at(-1).body.reasoning.effort, undefined);
+
+  await fetch(`http://127.0.0.1:${port}/models?client_version=1`, { headers });
+  await send({ model: "gpt-5.6-sol", reasoning: { effort: "auto" }, input: [] });
+  assert.equal(seen.at(-1).body.model, "gpt-5.6-sol");
+  assert.equal(seen.at(-1).body.reasoning.effort, "medium");
+
+  await send({ model: "gpt-5.6-sol", reasoning: { effort: "high" }, input: [] });
+  assert.equal(seen.at(-1).body.reasoning.effort, "high");
+});

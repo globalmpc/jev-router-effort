@@ -4,7 +4,7 @@ import https from "node:https";
 import { availableTiers, shouldUseExactModel } from "./config.mjs";
 import { log } from "./log.mjs";
 import { decide } from "./policy.mjs";
-import { createTaskRuntime, sendRoutingHold } from "./task-runtime.mjs";
+import { checkpointWarning, createTaskRuntime, sendRoutingHold } from "./task-runtime.mjs";
 import { askJev, warmJev } from "./router.mjs";
 import { writeDecision } from "./status.mjs";
 import { rejectForeign } from "./local-guard.mjs";
@@ -82,18 +82,19 @@ export function stripGlmNotes(body) {
   return body;
 }
 
-export function glmDecisionText({ model, effort, reason, confidence, effortConfidence }) {
+export function glmDecisionText({ model, effort, reason, confidence, effortConfidence, checkpoint = null }) {
   if (reason.startsWith("jev-unavailable")) return `[Jev] unavailable; using ${model}.`;
   const detail = confidence == null ? reason : `${reason}, confidence ${confidence.toFixed(2)}`;
   const effortDetail = effort
     ? `, effort ${effort}${effortConfidence == null ? "" : ` (${effortConfidence.toFixed(2)})`}`
     : "";
-  return `[Jev] routed this turn to ${model} (${detail}${effortDetail}).`;
+  return `[Jev] routed this turn to ${model} (${detail}${effortDetail}).${checkpointWarning(checkpoint)}`;
 }
 
 /** The synthetic decision call, in the shape the CLI's stream reducer and `chat()` both read. */
 export function noteToolCall(routing) {
-  const command = `echo '${glmDecisionText(routing).replace(/'/g, "")}'`;
+  // No quote can end the argument, and no backslash is left for an echo that expands escapes (sh, zsh).
+  const command = `echo '${glmDecisionText(routing).replace(/['\\]/g, "")}'`;
   return {
     id: `${NOTE_TOOL_PREFIX}${++noteSeq}`,
     type: "function",

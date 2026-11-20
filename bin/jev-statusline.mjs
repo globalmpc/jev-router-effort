@@ -23,7 +23,10 @@ const dir = (input.workspace?.current_dir ?? input.cwd ?? "").split(/[\\/]/).pop
 const pct = Math.round(input.context_window?.used_percentage ?? 0);
 
 let routed = `${DIM}jev: waiting for first prompt${RESET}`;
-if (status?.manual) {
+if (process.env.JEV_ROUTER_OFF) {
+  // jev-claude started without a key; Claude Code passes its env to the status line command.
+  routed = `\x1b[1;31mJev Router OFF: ${process.env.JEV_ROUTER_OFF}${RESET}`;
+} else if (status?.manual) {
   // The user picked this model with /model, so show their choice rather than a tier.
   routed = `${DIM}⏸ manual${RESET} ${input.model?.display_name ?? ""}`.trimEnd();
 } else if (status) {

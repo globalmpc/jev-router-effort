@@ -4,6 +4,7 @@ import { test } from "node:test";
 import {
   NOTE_TOOL_PREFIX,
   glmDecisionText,
+  noteToolCall,
   glmNewTurnPrompt,
   isNoteReply,
   startGlmProxy,
@@ -205,4 +206,24 @@ test("helpers", () => {
     glmDecisionText({ model: "glm-5.3", effort: "max", reason: "jev", confidence: 0.5, effortConfidence: null }),
     "[Jev] routed this turn to glm-5.3 (jev, confidence 0.50, effort max).",
   );
+});
+
+test("the GLM decision note says when a checkpoint failed, and stays one literal echo", () => {
+  const routing = { model: "glm-5.3", effort: "max", reason: "jev", confidence: 0.5, effortConfidence: null };
+  assert.equal(glmDecisionText({ ...routing, checkpoint: { ok: true } }), glmDecisionText(routing));
+  const failed = { ...routing, checkpoint: { ok: false, error: "can't stat 'a b'\n$(touch /tmp/x) `id`" } };
+  assert.match(glmDecisionText(failed), /Checkpoint FAILED, no recovery point for this turn: /);
+  const { command } = JSON.parse(noteToolCall(failed).function.arguments);
+  // One single-quoted argument: no quote inside can end it, so nothing in the error runs.
+  assert.match(command, /^echo '[^']*'$/);
+  assert.ok(!command.includes("\n"));
+});
+
+test("the GLM note cannot carry terminal escapes from a checkpoint error", () => {
+  const routing = { model: "glm-5.3", effort: "max", reason: "jev", confidence: 0.5, effortConfidence: null };
+  // Literal backslash escapes (expanded by echo in sh and zsh), raw ESC and BEL, and zsh's \c.
+  const error = "invalid path 'a\\033]0;PWNED\\007b' \x1b]0;RAW\x07 x\\c hidden";
+  const { command } = JSON.parse(noteToolCall({ ...routing, checkpoint: { ok: false, error } }).function.arguments);
+  assert.doesNotMatch(command, /[\\\x00-\x1f\x7f-\x9f]/);
+  assert.match(command, /^echo '[^']*hidden'$/);
 });
