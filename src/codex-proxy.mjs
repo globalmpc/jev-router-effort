@@ -387,9 +387,10 @@ export function jevDecisionEvents({ tier, model = codexModelOf(tier), effort, ef
       : `, effort ${effort} (manual)`
     : "";
   const id = `jev-${randomUUID()}`;
-  const text = reason.startsWith("jev-unavailable")
+  const caps = capabilities ? oneLine(capabilities) : "";
+  const text = oneLine(reason.startsWith("jev-unavailable")
     ? `[Jev] unavailable; using ${model}. Add JEV_API_KEY=... to ~/.jev-router.env and restart jev-codex.`
-    : `[Jev] routed this turn to ${model} (${detail}${effortDetail}).${capabilities ? ` ${capabilities}.` : ""}${checkpointWarning(checkpoint)}`;
+    : `[Jev] routed this turn to ${model} (${detail}${effortDetail}).${caps ? ` ${caps}.` : ""}${checkpointWarning(checkpoint)}`);
   const item = {
     type: "message",
     role: "assistant",
@@ -403,6 +404,43 @@ export function jevDecisionEvents({ tier, model = codexModelOf(tier), effort, ef
     { type: "response.output_item.done", item },
   ];
   return events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
+}
+
+/**
+ * Keeps a note on one line and inert: capability reasons come from Jev and checkpoint
+ * errors quote paths, so either may hold line breaks, control, bidi or invisible format
+ * characters (`Cc`, `Cf`), and a cut can leave half a surrogate pair (`Cs`).
+ */
+const oneLine = (text) => String(text).replace(/[\s\p{Cc}\p{Cf}\p{Cs}]+/gu, " ").trim();
+
+/** The opening of each note `jevDecisionEvents` writes. Model ids contain no spaces. */
+const CODEX_NOTE = /^\[Jev\] (?:routed this turn to \S+ \(|unavailable; using \S+\. )/;
+
+function isCodexNote(item) {
+  if (item?.role !== "assistant" || !Array.isArray(item.content) || item.content.length !== 1) return false;
+  const text = item.content[0]?.text;
+  if (typeof text !== "string" || text.includes("\n") || !CODEX_NOTE.test(text)) return false;
+  return item.phase === "commentary" || item.phase == null;
+}
+
+/**
+ * Removes this proxy's routing notes from the history. Returns the same body.
+ *
+ * Codex keeps each note as an assistant `commentary` message and sends it back, without
+ * its `jev-` id, on every later request. The model never wrote these messages, and a
+ * model that keeps reading them can start writing routing lines itself (seen with Claude,
+ * see `stripClaudeNotes`).
+ *
+ * Policy: a message goes only when it is one assistant part, on one line (every note is),
+ * that opens with the note, and is `commentary` or has no `phase` (a client that drops
+ * it). A message marked `final_answer` is never dropped; a one-line `commentary` or
+ * phase-less message that opens with the note goes, whoever wrote it. Unlike
+ * `stripClaudeNotes`, text is never edited, so routing lines a model wrote inside a
+ * multi-line reply stay.
+ */
+export function stripCodexNotes(body) {
+  if (Array.isArray(body?.input)) body.input = body.input.filter((item) => !isCodexNote(item));
+  return body;
 }
 
 const debug = (line) => process.env.JEV_DEBUG && log(line);
@@ -448,6 +486,10 @@ export async function startCodexProxy({
           if (process.env.JEV_DUMP) {
             writeDump(JSON.stringify(body, null, 2));
           }
+          // The dump above is what Codex sent; the upstream gets the history without notes.
+          // Compaction also comes through here: Codex 0.164 with this provider compacts via
+          // /responses in both login modes and never calls /responses/compact.
+          stripCodexNotes(body);
           if (isCodexRouterModel(body.model)) {
             const ultrafast = body.model === CODEX_ULTRAFAST_MODEL;
             if (ultrafast) body.service_tier = ULTRAFAST;

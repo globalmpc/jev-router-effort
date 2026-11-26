@@ -305,6 +305,9 @@ Each fresh decision appears as Codex commentary:
 [Jev] routed this turn to gpt-5.6-sol (jev, confidence 0.91, effort high (0.86)).
 ```
 
+Codex keeps these lines in the conversation. The proxy removes them before each request, so
+the model never reads them.
+
 For Codex, reasoning effort defaults to `auto`, which lets Jev choose the lowest sufficient
 API effort supported by the selected model, including `max` when advertised. The native
 picker also offers `ultra` when the account's catalog advertises it. Ultra is a Codex mode
